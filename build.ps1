@@ -16,6 +16,11 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination (Join-
 $buildDocs=Join-Path $outputPath 'docs'
 New-Item -ItemType Directory -Force -Path $buildDocs | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/BUILD.md') -Destination $buildDocs
+$screenshots=Join-Path $buildDocs 'screenshots'
+New-Item -ItemType Directory -Force -Path $screenshots | Out-Null
+foreach ($image in @('library.png','export.jpg')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "docs/screenshots/$image") -Destination $screenshots
+}
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Record-Film.ps1') -Destination (Join-Path $outputPath 'Record-Film.ps1')
 foreach ($name in @('native/main.obj','native/HostServices.obj','native/NativeEmblems.obj','native/NativeVideoSettings.obj','native/ReplayViewSettings.obj','native/NativeCamera.obj','native/NativeFonts.obj','native/NativeFontAssets.obj','native/NativePlayers.obj','native/NativeHud.obj','native/NativeHudServices.obj','native/NativeRecorder.obj','native/NativeAudio.obj','native/NativeSilentPlayback.obj','native/NativePlaybackTiming.obj','native/NativeTitleTiming.obj','native/NativeTitleHud.obj','native/native-host.pdb','native/NativeReplayBackend.pdb','native/NativeReplayBackend.ilk','native/build-native.cmd','MCCTheaterCapture.pdb')) {
     $generated=Join-Path $outputPath $name

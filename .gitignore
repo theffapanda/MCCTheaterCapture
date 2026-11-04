@@ -35,6 +35,10 @@
 !/docs/
 /docs/*
 !/docs/BUILD.md
+!/docs/screenshots/
+/docs/screenshots/*
+!/docs/screenshots/library.png
+!/docs/screenshots/export.jpg
 
 !/tools/
 /tools/*
