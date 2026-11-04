@@ -1,0 +1,43 @@
+{
+  "schema": "mcc-capture-vendor-identities/v1",
+  "files": [
+    {
+      "path": "deps/FreeType/freetype.dll",
+      "sha256": "558f16aec5ae86588afa80d46d9f2029c3081dc21015017ef85db7cf25e293a6"
+    },
+    {
+      "path": "deps/WebView2/lib/net462/Microsoft.Web.WebView2.Core.dll",
+      "sha256": "7c2e9c1e2089705b55e82a3d2cd2f57c4d72774e5c9ed5eef33d6616fa8184b4"
+    },
+    {
+      "path": "deps/WebView2/lib/net462/Microsoft.Web.WebView2.Wpf.dll",
+      "sha256": "4e19b4642dbad7a1fae43f6b435f9b8a25d1fa9d782e4933ef7c3a34b5d7e2c9"
+    },
+    {
+      "path": "deps/WebView2/runtimes/win-x64/native/WebView2Loader.dll",
+      "sha256": "ae69309c5e356350ea28d6b71a900bc43ee7e3f7a457d80a1f82efe6c419cc08"
+    },
+    {
+      "path": "deps/FFmpeg/bin/ffmpeg.exe",
+      "sha256": "53206fc7945ad49024bf9b77c8a473c95f3e687efc66aa53d556fb95d9cb7b11"
+    },
+    {
+      "path": "deps/FFmpeg/bin/ffprobe.exe",
+      "sha256": "d9f94da8fc9f337827564d9fbc0842ae18fb62b897ab3692473b9916ca9ee35f"
+    },
+    {
+      "path": "deps/FFmpeg/build-manifest.json",
+      "sha256": "a39b3445cf99ba33dc31e3dd5cb3c5759bd4b396290ecdd2567428281e8c195f"
+    }
+  ],
+  "requiredNotices": [
+    "deps/FreeType/FreeType-FTL.txt",
+    "deps/WebView2/LICENSE.txt",
+    "deps/WebView2/NOTICE.txt",
+    "native/THIRD_PARTY_LICENSES.txt",
+    "deps/FFmpeg/LICENSE",
+    "deps/FFmpeg/README.txt",
+    "deps/FFmpeg/x264-LICENSE.txt",
+    "deps/FFmpeg/zlib-LICENSE.txt"
+  ]
+}

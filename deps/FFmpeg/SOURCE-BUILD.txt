@@ -1,0 +1,31 @@
+Building the application-specific FFmpeg tools
+
+The source ZIP contains the exact FFmpeg, x264 and zlib source archives,
+their SHA-256 identities, license notices, configure results, and build scripts.
+No upstream source patches are applied. Build selection is in
+Build-MinimalFFmpeg.sh. Generated configuration headers are for audit; configure
+regenerates them for your build location.
+
+To rebuild from the application repository:
+1. Obtain w64devkit x64 2.11.0 and NASM win64 2.16.03 using the URLs and
+   SHA-256 hashes in build-manifest.json. Extract both portable toolchains.
+   Supply Bash from Git for Windows for x264's configure script.
+2. Run tools/Build-MinimalFFmpeg.ps1 -ToolchainDirectory <w64devkit folder>
+   -NasmDirectory <folder containing nasm.exe> -BashPath <bash.exe>.
+   Portable toolchains require no system installation.
+3. The script verifies and extracts deps/FFmpeg/source archives, compiles
+   static libraries and the two executables, then checks the feature contract.
+   Binaries are under artifacts/media-build/prefix/bin.
+4. Run export regression tests before replacing deps/FFmpeg/bin binaries.
+
+To rebuild from just the companion source ZIP:
+1. Make an empty working folder containing tools/ and deps/FFmpeg/.
+2. Extract the complete ZIP under deps/FFmpeg/.
+3. Copy Build-MinimalFFmpeg.ps1, Build-MinimalFFmpeg.sh and
+   Test-MinimalFFmpeg.ps1 from that folder to tools/.
+4. Follow steps 1–3 above. Windows tar.exe and PowerShell are used to extract
+   archives; the compiler and other Unix build utilities are portable.
+
+Media build inputs are source archives, not prebuilt third-party codec DLLs.
+GCC's standard Windows libraries are statically linked where applicable;
+only Windows system DLLs are imported by the resulting executables.

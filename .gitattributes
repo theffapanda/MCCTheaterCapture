@@ -1,0 +1,8 @@
+* text=auto
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.sh text eol=lf
+*.png binary
+*.dll binary
+# This manifest is checked by SHA-256; preserve its bytes on Windows checkouts.
+/deps/FFmpeg/build-manifest.json text eol=lf

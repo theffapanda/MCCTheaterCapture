@@ -1,0 +1,14 @@
+{
+  "version": "9.0.2-mcc-minimal",
+  "buildManifestSha256": "a39b3445cf99ba33dc31e3dd5cb3c5759bd4b396290ecdd2567428281e8c195f",
+  "files": [
+    {
+      "name": "ffmpeg.exe",
+      "sha256": "53206fc7945ad49024bf9b77c8a473c95f3e687efc66aa53d556fb95d9cb7b11"
+    },
+    {
+      "name": "ffprobe.exe",
+      "sha256": "d9f94da8fc9f337827564d9fbc0842ae18fb62b897ab3692473b9916ca9ee35f"
+    }
+  ]
+}

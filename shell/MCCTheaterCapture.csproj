@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>MCCTheaterCapture</AssemblyName>
+    <RootNamespace>MCCTheaterCapture</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="../deps/FFmpeg/bin/*.exe" Link="tools/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../deps/FFmpeg/LICENSE" Link="licenses/FFmpeg-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../deps/FFmpeg/README.txt" Link="licenses/FFmpeg-README.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../deps/FFmpeg/*-LICENSE.txt" Link="licenses/FFmpeg-%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Reference Include="Microsoft.Web.WebView2.Core"><HintPath>../deps/WebView2/lib/net462/Microsoft.Web.WebView2.Core.dll</HintPath></Reference>
+    <Reference Include="Microsoft.Web.WebView2.Wpf"><HintPath>../deps/WebView2/lib/net462/Microsoft.Web.WebView2.Wpf.dll</HintPath></Reference>
+    <Content Include="../deps/WebView2/runtimes/win-x64/native/WebView2Loader.dll" Link="WebView2Loader.dll" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../deps/WebView2/LICENSE.txt" Link="licenses/WebView2-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../deps/WebView2/NOTICE.txt" Link="licenses/WebView2-NOTICE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="web/**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
