@@ -2,7 +2,6 @@
 #include "NativeEmblems.h"
 #include <bcrypt.h>
 #include <intrin.h>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -13,15 +12,13 @@
 #include <vector>
 
 namespace {
-constexpr char kHash[] = "b209d8454b12dc77e54ccd2c9924ec8d44b8619d21cf98e36ffaf601e67efb63";
-constexpr size_t kDraw = 0x330108, kCall = 0x33055E;
+constexpr size_t kCall = 0x33055E;
 BYTE* image = nullptr;
 void* bridge = nullptr;
 void (*logger)(const char*, const char*) = nullptr;
 std::mutex initialization;
 std::mutex observations;
 std::set<std::uint64_t> observed;
-using DrawBitmap = void (*)(const NativeEmblemDraw*, const void*);
 
 bool Read(const void* source, void* output, size_t size) {
     SIZE_T got = 0;
@@ -62,40 +59,29 @@ std::string Hash(HMODULE module) {
 }
 
 // The sole slot72 call in the pinned engine preserves the original packet in
-// RSI and viewport in R13. Its public host ABI discards both and supplies an
-// account ID and an axis-aligned normalized rectangle instead. A tail bridge
-// recovers the native inputs, retaining rotated geometry, clip, atlas and tint.
-// Keeping bit3 and clearing the account selects its legacy fallback at33057E.
-// Clearing bit3 would skip that fallback entirely and draw an ordinary bitmap.
-__declspec(noinline) void Draw(const NativeEmblemDraw* source, const void* viewport) {
+// RSI and viewport in R13. Its public host ABI discards both and supplies only
+// an account ID and an axis-aligned normalized rectangle; retail MCC then draws
+// the account's MCC emblem, which films do not record. The packet's legacy
+// Halo 3 emblem bytes are per-match placeholders (random foreground/background,
+// constant colors), so drawing them shows the wrong emblem. Unknown emblems are
+// therefore left blank, exactly like the unhooked slot72 stub. The bridge only
+// records the packet for diagnostics.
+__declspec(noinline) void Draw(const NativeEmblemDraw* source, const void*) {
     if (_ReturnAddress() != image + kCall + 7) return;
-    NativeEmblemDraw input{}, packet{};
-    std::array<short, 4> bounds{};
-    if (!Read(source, &input, sizeof(input)) || !Read(viewport, bounds.data(), sizeof(bounds)) ||
-        bounds[2] <= bounds[0] || bounds[3] <= bounds[1] || !PrepareNativeEmblemDraw(input, packet)) return;
-    reinterpret_cast<DrawBitmap>(image + kDraw)(&packet, viewport);
+    NativeEmblemDraw input{};
+    if (!Read(source, &input, sizeof(input)) || !(input.flags & 8) || !input.player) return;
     std::uint64_t emblem = 0;
-    std::memcpy(&emblem, packet.emblem.data(), sizeof(emblem));
+    std::memcpy(&emblem, input.emblem.data(), sizeof(emblem));
     std::lock_guard<std::mutex> lock(observations);
     if (observed.size() < 32 && observed.insert(emblem).second && logger) {
         char text[384]{};
         std::snprintf(text, sizeof(text),
-            "source=recorded-native-packet player=%llx atlas=%x foreground=%u background=%u flags=%u colors=%u,%u,%u tint=%08x shader=63",
-            static_cast<unsigned long long>(input.player), packet.bitmap, packet.emblem[0], packet.emblem[1],
-            packet.emblem[2], packet.emblem[3], packet.emblem[4], packet.emblem[5], packet.tint);
-        logger("native_emblem_draw", text);
+            "source=recorded-native-packet drawn=false reason=account-emblem-unknown player=%llx atlas=%x foreground=%u background=%u flags=%u colors=%u,%u,%u",
+            static_cast<unsigned long long>(input.player), input.bitmap, input.emblem[0], input.emblem[1],
+            input.emblem[2], input.emblem[3], input.emblem[4], input.emblem[5]);
+        logger("native_emblem_blank", text);
     }
 }
-}
-
-bool PrepareNativeEmblemDraw(const NativeEmblemDraw& source, NativeEmblemDraw& output) {
-    if (!(source.flags & 8) || !source.player || source.bitmap == -1) return false;
-    for (float corner : source.corners) if (!std::isfinite(corner)) return false;
-    if (!std::isfinite(source.u) || !std::isfinite(source.v)) return false;
-    output = source;
-    output.flags = (source.flags & ~7u) | 16u;
-    output.player = 0;
-    return true;
 }
 
 bool InitializeNativeEmblems(HMODULE module, void* host, void (*log)(const char*, const char*)) {
@@ -105,7 +91,6 @@ bool InitializeNativeEmblems(HMODULE module, void* host, void (*log)(const char*
     auto** table = *reinterpret_cast<void***>(host);
     if (bridge) return module == reinterpret_cast<HMODULE>(image) && table[72] == bridge;
     if (!IsSupportedHalo3Hash(Hash(module)) ||
-        !Code(module, kDraw, {0x48,0x8B,0xC4,0x48,0x89,0x50,0x10,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55}) ||
         !Code(module, 0x330519, {0x48,0x8B,0x0D,0x98,0xC5,0x70,0x00,0x48,0x8B,0x56,0x38}) ||
         !Code(module, kCall, {0x41,0xFF,0x91,0x40,0x02,0x00,0x00}) ||
         !Code(module, 0x330586, {0x48,0x8D,0x4E,0x30,0xE8,0xD5,0xDE,0x07,0x00}))
@@ -127,6 +112,6 @@ bool InitializeNativeEmblems(HMODULE module, void* host, void (*log)(const char*
     }
     image = reinterpret_cast<BYTE*>(module); logger = log; bridge = memory;
     table[72] = bridge;
-    if (log) log("native_emblems_ready", "slot=72 recorded layered native shader; original atlas, foreground/background, colors, toggles, flips, bounds and tint; no account lookup");
+    if (log) log("native_emblems_ready", "slot=72 unknown account emblems left blank; recorded legacy packet logged only; no account lookup");
     return true;
 }

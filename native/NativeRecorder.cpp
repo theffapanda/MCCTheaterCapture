@@ -30,8 +30,14 @@ namespace {
 // High-motion upload master. Keep 60 progressive frames and give fast camera
 // pans, particles and foliage more headroom before YouTube's own transcode.
 constexpr UINT kWidth=2560,kHeight=1440,kFps=60,kBitrate=50000000;
-constexpr UINT kGopFrames=kFps/2,kQualityVsSpeed=100;
+constexpr UINT kQualityVsSpeed=100;
 constexpr const char* kEncodingProfile="youtube-fast-1440p60-v1";
+// Video-only offline export frame rate (60, or 120 for Halo 3 interpolated frames). Bitrate scales with it so
+// per-frame quality matches the 60 fps profile. Real-time and audio paths stay on the 60 Hz tick clock (kFps).
+UINT exportFps=60;
+UINT VideoFps(){return exportFps;}
+UINT VideoBitrate(){return kBitrate*(exportFps/kFps);}
+UINT VideoGop(){return exportFps/2;}
 constexpr UINT kAudioRate=48000,kAudioChannels=2,kAudioBitrate=192000;
 constexpr size_t kPoolFrames=8,kGpuFrames=4;
 constexpr LONGLONG kTimeBase=10000000;
@@ -51,6 +57,9 @@ struct Recorder {
     uint64_t generation=0,captured=0,encoded=0,repeated=0,dropped=0,pendingGpu=0,queuePeak=0;
     uint64_t audioFrames=0,audioSourceFrames=0,audioGapFrames=0,audioNonSilentFrames=0,audioDiscontinuities=0;
     LONGLONG audioKnownUntil=0;std::vector<AudioSpan> audioSpans;
+    // Audio-only pass: active time (100 ns, same clock as the audio sample positions) at which each new
+    // film tick was first observed. The shell uses this to place the real-time soundtrack on film ticks.
+    std::vector<std::pair<LONGLONG,int>> tickAnchors;
     int firstTick=-1,lastTick=-1;
     int observedFilmTick=-1;
     double readbackMs=0,convertMs=0,encodeMs=0,poolWaitMs=0;
@@ -79,7 +88,7 @@ std::string Quote(const std::string& value){
 }
 void Log(const char* event,const std::string& detail){if(g.logger)g.logger(event,detail.c_str());}
 std::string Result(HRESULT hr){char text[16]{};std::snprintf(text,sizeof(text),"0x%08lX",static_cast<unsigned long>(hr));return text;}
-LONGLONG SampleTime(uint64_t index){return static_cast<LONGLONG>(index*kTimeBase/kFps);}
+LONGLONG SampleTime(uint64_t index){return static_cast<LONGLONG>(index*kTimeBase/VideoFps());}
 LONGLONG AudioTime(uint64_t index){return static_cast<LONGLONG>(index*kTimeBase/kAudioRate);}
 LONGLONG QpcTime(LONGLONG counter,LONGLONG frequency){return counter/frequency*kTimeBase+(counter%frequency)*kTimeBase/frequency;}
 void Fail(const std::string& message,HRESULT hr=S_OK){
@@ -95,10 +104,10 @@ HRESULT MediaType(ComPtr<IMFMediaType>& type,bool output){
     if(SUCCEEDED(hr))hr=type->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video);
     if(SUCCEEDED(hr))hr=type->SetGUID(MF_MT_SUBTYPE,output?MFVideoFormat_H264:MFVideoFormat_RGB32);
     if(SUCCEEDED(hr))hr=MFSetAttributeSize(type.Get(),MF_MT_FRAME_SIZE,kWidth,kHeight);
-    if(SUCCEEDED(hr))hr=MFSetAttributeRatio(type.Get(),MF_MT_FRAME_RATE,kFps,1);
+    if(SUCCEEDED(hr))hr=MFSetAttributeRatio(type.Get(),MF_MT_FRAME_RATE,VideoFps(),1);
     if(SUCCEEDED(hr))hr=MFSetAttributeRatio(type.Get(),MF_MT_PIXEL_ASPECT_RATIO,1,1);
     if(SUCCEEDED(hr))hr=type->SetUINT32(MF_MT_INTERLACE_MODE,MFVideoInterlace_Progressive);
-    if(SUCCEEDED(hr)&&output)hr=type->SetUINT32(MF_MT_AVG_BITRATE,kBitrate);
+    if(SUCCEEDED(hr)&&output)hr=type->SetUINT32(MF_MT_AVG_BITRATE,VideoBitrate());
     if(SUCCEEDED(hr)&&output)hr=type->SetUINT32(MF_MT_MPEG2_PROFILE,eAVEncH264VProfile_High);
     if(SUCCEEDED(hr)&&!output)hr=type->SetUINT32(MF_MT_DEFAULT_STRIDE,kWidth*4); // positive = top down
     if(SUCCEEDED(hr)&&!output)hr=type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT,TRUE);
@@ -149,9 +158,9 @@ void ConfigureEncoder(IMFSinkWriter* writer,DWORD stream){
     };
     int quality=-1,gop=-1,mode=-1,cabac=-1,meanBitrate=-1;
     option(CODECAPI_AVEncCommonRateControlMode,"rateControlMode",eAVEncCommonRateControlMode_UnconstrainedVBR,mode);
-    option(CODECAPI_AVEncCommonMeanBitRate,"meanBitrate",kBitrate,meanBitrate);
+    option(CODECAPI_AVEncCommonMeanBitRate,"meanBitrate",VideoBitrate(),meanBitrate);
     option(CODECAPI_AVEncCommonQualityVsSpeed,"qualityVsSpeed",kQualityVsSpeed,quality);
-    option(CODECAPI_AVEncMPVGOPSize,"gopFrames",kGopFrames,gop);
+    option(CODECAPI_AVEncMPVGOPSize,"gopFrames",VideoGop(),gop);
     option(CODECAPI_AVEncH264CABACEnable,"cabac",1,cabac,true);
     std::lock_guard<std::mutex> lock(g.mutex);g.qualityVsSpeed=quality;g.gopFrames=gop;g.rateControlMode=mode;g.cabac=cabac;
 }
@@ -169,9 +178,9 @@ HRESULT CreateWriter(IMFByteStream* bytes,bool hardware,ComPtr<IMFSinkWriter>& w
     ComPtr<IMFAttributes> encoding;
     if(SUCCEEDED(hr))hr=MFCreateAttributes(&encoding,5);
     if(SUCCEEDED(hr))hr=encoding->SetUINT32(CODECAPI_AVEncCommonRateControlMode,eAVEncCommonRateControlMode_UnconstrainedVBR);
-    if(SUCCEEDED(hr))hr=encoding->SetUINT32(CODECAPI_AVEncCommonMeanBitRate,kBitrate);
+    if(SUCCEEDED(hr))hr=encoding->SetUINT32(CODECAPI_AVEncCommonMeanBitRate,VideoBitrate());
     if(SUCCEEDED(hr))hr=encoding->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed,kQualityVsSpeed);
-    if(SUCCEEDED(hr))hr=encoding->SetUINT32(CODECAPI_AVEncMPVGOPSize,kGopFrames);
+    if(SUCCEEDED(hr))hr=encoding->SetUINT32(CODECAPI_AVEncMPVGOPSize,VideoGop());
     if(SUCCEEDED(hr))hr=encoding->SetUINT32(CODECAPI_AVEncH264CABACEnable,TRUE);
     if(SUCCEEDED(hr)){
         hr=writer->SetInputMediaType(stream,input.Get(),encoding.Get());
@@ -409,6 +418,16 @@ void EncodeSession(){
     bool failed=false;uint64_t count=0;
     {std::lock_guard<std::mutex> lock(g.mutex);count=g.encoded;failed=g.failed;}
     if(!failed&&!count)Fail("No video frames were captured; the MP4 does not contain a playable recording");
+    if(!failed&&audioOnly){
+        // Sidecar "<output>.ticks": header, then "<activeTime100ns> <filmTick>" per observed tick change.
+        std::vector<std::pair<LONGLONG,int>> anchors;{std::lock_guard<std::mutex> lock(g.mutex);anchors=g.tickAnchors;}
+        FILE* file=nullptr;
+        if(_wfopen_s(&file,(path+L".ticks").c_str(),L"wb")==0&&file){
+            std::fputs("mcc-audio-ticks/v1\n",file);
+            for(const auto& [time,tick]:anchors)std::fprintf(file,"%lld %d\n",time,tick);
+            if(std::fclose(file)!=0)Fail("Cannot write audio tick timing");
+        }else Fail("Cannot create audio tick timing file");
+    }
     {std::lock_guard<std::mutex> lock(g.mutex);g.encoderReady=false;g.pool.clear();g.queue.clear();g.phase=g.failed||g.incomplete?"error":"complete";}
     Log("native_recording_finalized",Utf8(path)+"; frames="+std::to_string(count)+(failed?"; recording failed":""));
 }
@@ -466,7 +485,7 @@ bool RequestStartNativeRecording(const wchar_t* outputPath){
      else{g.path=path.wstring();g.phase="starting";g.error.clear();g.failed=false;g.incomplete=false;g.stop=false;g.producerClosed=false;g.encoderReady=false;g.fallback=false;g.hardwareKnown=false;g.hardwareEncoder=false;g.encoder.clear();g.qualityVsSpeed=g.gopFrames=g.rateControlMode=g.cabac=-1;
         g.captured=g.encoded=g.repeated=g.dropped=g.pendingGpu=g.queuePeak=0;g.audioFrames=g.audioSourceFrames=g.audioGapFrames=g.audioNonSilentFrames=g.audioDiscontinuities=0;
         g.readbackMs=g.convertMs=g.encodeMs=g.poolWaitMs=0;
-        g.audioKnownUntil=0;g.audioSpans.clear();g.firstTick=g.lastTick=g.observedFilmTick=-1;g.queue.clear();g.pool.clear();++g.generation;g.start=true;}}
+        g.audioKnownUntil=0;g.audioSpans.clear();g.tickAnchors.clear();g.firstTick=g.lastTick=g.observedFilmTick=-1;g.queue.clear();g.pool.clear();++g.generation;g.start=true;}}
     if(!rejection.empty()){Log("native_recording_rejected",rejection);return false;}
     g.cv.notify_all();return true;
 }
@@ -480,6 +499,7 @@ void ConfigureNativeOfflineRecording(const wchar_t* source){offlineAudio=source?
 void ConfigureNativeAudioOnlyRecording(bool enabled){audioOnly=enabled;}
 void ConfigureNativeVideoOnlyRecording(bool enabled){videoOnly=enabled;}
 void ConfigureNativeFrameOrigin(int firstTick){configuredFrameOrigin=firstTick;}
+void ConfigureNativeExportFrameRate(unsigned fps){exportFps=fps==120?120:60;}
 void NativeRecorderFrame(IDXGISwapChain* chain,int filmTick,bool paused){
     uint64_t generation=0;bool ready=false,stop=false,failed=false,closed=false;
     ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
@@ -538,6 +558,7 @@ void NativeRecorderFrame(IDXGISwapChain* chain,int filmTick,bool paused){
         std::lock_guard<std::mutex> lock(g.mutex);
         // Timing units for the audio pass, rather than encoded video frames.
         g.encoded=g.captured=index+1;g.lastTick=filmTick;if(g.firstTick<0)g.firstTick=filmTick;
+        if(g.tickAnchors.empty()||g.tickAnchors.back().second!=filmTick)g.tickAnchors.emplace_back(g.activeTime,filmTick);
         return;
     }
     if(index<g.nextCapture)return;
@@ -556,17 +577,17 @@ void NativeRecorderFrame(IDXGISwapChain* chain,int filmTick,bool paused){
     context->CopyResource(found->texture.Get(),back.Get());found->pending=true;found->index=index;
     // The film-reader cursor is asynchronous. Frame timestamps follow the
     // acknowledged simulation clock, rather than that read-ahead cursor.
-    found->filmTick=!Offline()?filmTick:g.offlineFirstTick+static_cast<int>(index);
+    found->filmTick=!Offline()?filmTick:g.offlineFirstTick+static_cast<int>(index/(exportFps/kFps));
     g.gpuOrder.push_back(static_cast<size_t>(found-g.gpu.begin()));g.nextCapture=index+1;
     {std::lock_guard<std::mutex> lock(g.mutex);++g.captured;++g.pendingGpu;}
     if(Offline())CompleteNativeExportFrame();
 }
 std::string SnapshotNativeRecordingJson(){
     std::lock_guard<std::mutex> lock(g.mutex);const auto state=g.phase=="complete"?"stopped":g.phase;
-    const double seconds=static_cast<double>(g.encoded)/kFps;std::ostringstream out;
+    const double seconds=static_cast<double>(g.encoded)/VideoFps();std::ostringstream out;
     out<<"{\"type\":\"recording\",\"schema\":\"mcc-native-recording/v1\",\"state\":"<<Quote(state)<<",\"phase\":"<<Quote(g.phase)<<",\"file\":"<<Quote(Utf8(g.path))<<",\"path\":"<<Quote(Utf8(g.path))
-       <<",\"audioOnly\":"<<(audioOnly?"true":"false")<<",\"width\":"<<kWidth<<",\"height\":"<<kHeight<<",\"fps\":"<<kFps<<",\"bitrate\":"<<kBitrate<<",\"videoOnly\":"<<(videoOnly?"true":"false")<<",\"audio\":"<<(videoOnly?"false":"true")<<",\"audioSource\":"<<Quote(NativeAudioCaptureSource())<<",\"audioCodec\":\"AAC\",\"audioSampleRate\":"<<kAudioRate<<",\"audioChannels\":"<<kAudioChannels<<",\"audioBitrate\":"<<kAudioBitrate
-       <<",\"encodingProfile\":"<<Quote(!Offline()?kEncodingProfile:"offline-1440p60-v2")<<",\"qualityVsSpeed\":"<<(g.qualityVsSpeed<0?"null":std::to_string(g.qualityVsSpeed))<<",\"gopFrames\":"<<(g.gopFrames<0?"null":std::to_string(g.gopFrames))<<",\"rateControlMode\":"<<(g.rateControlMode<0?"null":std::to_string(g.rateControlMode))<<",\"cabac\":"<<(g.cabac<0?"null":g.cabac?"true":"false")
+       <<",\"audioOnly\":"<<(audioOnly?"true":"false")<<",\"width\":"<<kWidth<<",\"height\":"<<kHeight<<",\"fps\":"<<VideoFps()<<",\"bitrate\":"<<VideoBitrate()<<",\"videoOnly\":"<<(videoOnly?"true":"false")<<",\"audio\":"<<(videoOnly?"false":"true")<<",\"audioSource\":"<<Quote(NativeAudioCaptureSource())<<",\"audioCodec\":\"AAC\",\"audioSampleRate\":"<<kAudioRate<<",\"audioChannels\":"<<kAudioChannels<<",\"audioBitrate\":"<<kAudioBitrate
+       <<",\"encodingProfile\":"<<Quote(!Offline()?kEncodingProfile:exportFps==120?"offline-1440p120-v1":"offline-1440p60-v2")<<",\"qualityVsSpeed\":"<<(g.qualityVsSpeed<0?"null":std::to_string(g.qualityVsSpeed))<<",\"gopFrames\":"<<(g.gopFrames<0?"null":std::to_string(g.gopFrames))<<",\"rateControlMode\":"<<(g.rateControlMode<0?"null":std::to_string(g.rateControlMode))<<",\"cabac\":"<<(g.cabac<0?"null":g.cabac?"true":"false")
        <<",\"audioFrames\":"<<g.audioFrames<<",\"audioSourceFrames\":"<<g.audioSourceFrames<<",\"audioGapFrames\":"<<g.audioGapFrames<<",\"audioNonSilentFrames\":"<<g.audioNonSilentFrames<<",\"audioDiscontinuities\":"<<g.audioDiscontinuities
        <<",\"frames\":"<<g.encoded<<",\"encodedFrames\":"<<g.encoded<<",\"capturedFrames\":"<<g.captured
        <<",\"readbackMs\":"<<g.readbackMs<<",\"convertMs\":"<<g.convertMs<<",\"encodeMs\":"<<g.encodeMs<<",\"poolWaitMs\":"<<g.poolWaitMs

@@ -38,6 +38,7 @@
 #include "NativeGameTitle.h"
 #include "NativeTitleTiming.h"
 #include "NativeTitleHud.h"
+#include "NativeAudioResync.h"
 
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
@@ -64,6 +65,8 @@ static std::atomic<int> captureCountdown{-1};
 static bool backgroundMode=false;
 static bool offlineExport=false;
 static uint64_t offlineFrameLimit=0;
+// Rendered frames per 60 Hz film tick in video-only export (2 = 120 fps).
+static int exportFramesPerTick=1;
 static double JsonNumber(const std::string& line,const std::string& key);
 static std::atomic<bool> backgroundPauseNeeded{false},backgroundPauseApplied{false},backgroundCaptureArmed{false};
 static std::atomic<bool> backgroundPrimeRequested{false},backgroundPrimed{false};
@@ -445,16 +448,19 @@ static int Run(int argc,wchar_t** argv) {
       else if(key==L"--audio-only") {if(_wcsicmp(value,L"true")&&_wcsicmp(value,L"false")){std::fprintf(stderr,"--audio-only expects true or false\n");return 2;}audioOnly=!_wcsicmp(value,L"true");ConfigureNativeAudioOnlyRecording(audioOnly);}
       else if(key==L"--video-only") {if(_wcsicmp(value,L"true")&&_wcsicmp(value,L"false")){std::fprintf(stderr,"--video-only expects true or false\n");return 2;}videoOnly=!_wcsicmp(value,L"true");ConfigureNativeVideoOnlyRecording(videoOnly);}
       else if(key==L"--record-seconds") {wchar_t* end=nullptr;recordSeconds=wcstod(value,&end);if(!end||*end||!std::isfinite(recordSeconds)||recordSeconds<=0||recordSeconds>43200){std::fprintf(stderr,"--record-seconds expects a positive duration up to43200\n");return 2;}}
+      else if(key==L"--frame-rate") {if(!_wcsicmp(value,L"60"))exportFramesPerTick=1;else if(!_wcsicmp(value,L"120"))exportFramesPerTick=2;else{std::fprintf(stderr,"--frame-rate expects 60 or 120\n");return 2;}}
       else if(key==L"--record-start-tick") {wchar_t* end=nullptr;long selected=wcstol(value,&end,10);if(end==value||!end||*end||selected<0||selected>43200*60){std::fprintf(stderr,"--record-start-tick expects a bounded native tick\n");return 2;}recordStartTick=static_cast<int32_t>(selected);}
       else { std::fwprintf(stderr,L"Unknown argument: %s\n",key.c_str()); return 2; }
     }
     if(root.empty()||film.empty()||output.empty()||seconds<0||seconds>43200) return 2;
     if((videoOnly&&(audioOnly||!audioSource.empty()))||(audioOnly&&!audioSource.empty())){std::fprintf(stderr,"Conflicting audio/video pass options\n");return 2;}
+    if(exportFramesPerTick!=1&&(!videoOnly||recordStartTick>0)){std::fprintf(stderr,"--frame-rate 120 is supported only for whole-film video-only export passes\n");return 2;}
     offlineExport=videoOnly||!audioSource.empty();
     if(offlineExport){
       if(!backgroundMode||(!videoOnly&&!fs::is_regular_file(audioSource))){std::fprintf(stderr,"Offline export requires background mode and an existing audio-source MP4 or video-only mode\n");return 2;}
       ConfigureNativeOfflineRecording(audioSource.c_str());
-      if(recordSeconds>0)offlineFrameLimit=static_cast<uint64_t>(std::ceil(recordSeconds*60));
+      ConfigureNativeExportFrameRate(60u*static_cast<unsigned>(exportFramesPerTick));SetNativeExportFramesPerTick(exportFramesPerTick);
+      if(recordSeconds>0)offlineFrameLimit=static_cast<uint64_t>(std::ceil(recordSeconds*60))*exportFramesPerTick;
     }
     if(backgroundMode&&(parentWindow||recordOutput.empty())) {std::fprintf(stderr,"Background capture requires --record-output and creates its own hidden viewport\n");return 2;}
     if(recordStartTick>0&&(!backgroundMode||recordSeconds<=0||recordStartTick<3)){std::fprintf(stderr,"A capture start tick requires a bounded background capture starting at tick 3 or later\n");return 2;}
@@ -508,6 +514,7 @@ static int Run(int argc,wchar_t** argv) {
     auto dll=root/gameTitle->wideFolder/(std::wstring(gameTitle->wideFolder)+L".dll");
     auto dh=HashFile(dll); LogText("input_engine",Narrow(dll.wstring())+" sha256="+dh);
     if(!gameTitle->MatchesHash(dh)) { Log("failure","Installed engine build is unsupported for this film title"); return 3; }
+    if(exportFramesPerTick!=1&&!gameTitle->Halo3()) { Log("failure","120 fps export is available for Halo 3 films only"); return 3; }
     if(!fs::exists(film)) { Log("failure","Recording file does not exist"); return 3; }
     { std::ifstream in(film,std::ios::binary); char signature[4]{}; in.read(signature,4); if(memcmp(signature,"_blf",4)) { Log("failure","Expected a native Halo saved-film .mov"); return 3; } }
     LogText("input_film",Narrow(film.wstring())+" sha256="+HashFile(film));
@@ -515,7 +522,7 @@ static int Run(int argc,wchar_t** argv) {
     if(backgroundMode) {
       if(backgroundTotalTicks<=0) {Log("failure","Cannot verify the original film duration for automatic end-of-film capture");return 3;}
       if(recordStartTick>=backgroundTotalTicks){Log("failure","Capture start tick is outside the film");return 3;}
-      if(offlineExport)offlineFrameLimit=std::min<uint64_t>(offlineFrameLimit?offlineFrameLimit:backgroundTotalTicks,backgroundTotalTicks-recordStartTick);
+      if(offlineExport)offlineFrameLimit=std::min<uint64_t>(offlineFrameLimit?offlineFrameLimit:static_cast<uint64_t>(backgroundTotalTicks)*exportFramesPerTick,static_cast<uint64_t>(backgroundTotalTicks-recordStartTick)*exportFramesPerTick);
       LogText("background_original_film_duration","ticks="+std::to_string(backgroundTotalTicks)+"; seconds="+std::to_string(backgroundTotalTicks/60.0));
     }
     WNDCLASSW wc{}; wc.lpfnWndProc=WindowProc; wc.hInstance=GetModuleHandleW(nullptr); wc.lpszClassName=L"NativeReplayPoc01a17510"; wc.hCursor=LoadCursor(nullptr,IDC_ARROW); RegisterClassW(&wc);
@@ -705,7 +712,7 @@ static int Run(int argc,wchar_t** argv) {
         }
       }
       if(backgroundSuccess) {
-        const double actual=JsonNumber(finalRecording,"frames")/60.0;
+        const double actual=JsonNumber(finalRecording,"frames")/(60.0*(offlineExport?exportFramesPerTick:1));
         const double expected=(recordSeconds>0?JsonNumber(finalRecording,"lastFilmTick")-JsonNumber(finalRecording,"firstFilmTick")+1:backgroundTotalTicks)/60.0;
         const double tolerance=std::max(.15,expected*.01);
         const bool normalSpeed=expected>0&&actual>0&&std::fabs(actual-expected)<=tolerance;
@@ -721,5 +728,6 @@ static int Run(int argc,wchar_t** argv) {
     return gameTitle->Halo3()&&NativeValue<int32_t>(0xA3CAD0)?10:0;
 }
 int wmain(int argc,wchar_t** argv) {
+    if(argc>1&&std::wstring_view(argv[1])==L"--resync-audio"){int resynced=RunNativeAudioResync(argc,argv);std::fflush(stdout);std::fflush(stderr);return resynced;}
     int result=Run(argc,argv); std::fflush(stdout); if(events.is_open()) events.flush(); if(gameTitle&&!gameTitle->Halo3())TerminateProcess(GetCurrentProcess(),result);ExitProcess(result);
 }

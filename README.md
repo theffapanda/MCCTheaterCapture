@@ -2,6 +2,8 @@
 
 Play and export MCC Theater films from Halo 3, Halo: Reach, Halo 4, and Halo 2 Anniversary multiplayer. Export full matches or multikill highlights as MP4 or MOV with game audio.
 
+Halo 3 full-match and sample exports support 60 or 120 fps. Other games and multikill highlights export at 60 fps.
+
 ![Sequence and export settings in MCC Theater Capture](docs/screenshots/export.jpg)
 
 Requires Windows x64, an installed copy of MCC with the matching game content, and original Theater films. Only supported MCC engine builds work; game files are not included.

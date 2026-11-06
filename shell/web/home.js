@@ -100,7 +100,7 @@
     return `${percent} · Current film: ${eta(job.estimatedSecondsRemaining)} remaining + finalization`;
   }
   function fresh(previous) {
-    return {schema:'mcc-batch/v1', id:crypto.randomUUID().replaceAll('-', ''), name:previous?.name || 'Theater reel', mode:previous?.mode || 'separate', outputFormat:previous?.outputFormat || 'mp4', outputResolution:previous?.outputResolution || 1440, outputQuality:previous?.outputQuality || 'high', fov:previous?.fov || batch.fov || 91, captureKind:previous?.captureKind || 'full', highlightOptions:previous?.highlightOptions || {minimumKills:4,exact:false,selection:'all',beforeSeconds:3,afterSeconds:3}, highlightFormat:structuredClone(previous?.highlightFormat || {layout:'original',blur:22,dim:40,gameplayPosition:48}),highlightCaptions:structuredClone(previous?.highlightCaptions || {}),sampleSeconds:previous?.sampleSeconds || null, continueOnError:previous?.continueOnError ?? true, items:[], signature:'', state:'draft'};
+    return {schema:'mcc-batch/v1', id:crypto.randomUUID().replaceAll('-', ''), name:previous?.name || 'Theater reel', mode:previous?.mode || 'separate', outputFormat:previous?.outputFormat || 'mp4', outputResolution:previous?.outputResolution || 1440, outputQuality:previous?.outputQuality || 'high', frameRate:previous?.frameRate || 60, fov:previous?.fov || batch.fov || 91, captureKind:previous?.captureKind || 'full', highlightOptions:previous?.highlightOptions || {minimumKills:4,exact:false,selection:'all',beforeSeconds:3,afterSeconds:3}, highlightFormat:structuredClone(previous?.highlightFormat || {layout:'original',blur:22,dim:40,gameplayPosition:48}),highlightCaptions:structuredClone(previous?.highlightCaptions || {}),sampleSeconds:previous?.sampleSeconds || null, continueOnError:previous?.continueOnError ?? true, items:[], signature:'', state:'draft'};
   }
   function readControls() {
     if (!draft || locked()) return;
@@ -109,6 +109,7 @@
     draft.outputFormat = $('output-format').value;
     draft.outputResolution = Number($('output-resolution').value);
     draft.outputQuality = $('output-quality').value;
+    draft.frameRate = Number($('output-fps').value);
     draft.mode = document.querySelector('input[name=mode]:checked').value;
     draft.fov = Number($('batch-fov').value);
     draft.sampleSeconds = $('capture-length').value === 'sample' ? Number($('sample-seconds').value) : null;
@@ -121,6 +122,7 @@
     $('output-format').value = draft.outputFormat || 'mp4';
     $('output-resolution').value = draft.outputResolution || 1440;
     $('output-quality').value = draft.outputQuality || 'high';
+    $('output-fps').value = draft.frameRate || 60;
     $('reel-name').value = draft.name; $('batch-fov').value = draft.fov;
     $('capture-length').value = draft.captureKind === 'highlights' ? 'highlights' : draft.sampleSeconds != null ? 'sample' : 'full';
     applyHighlightOptions(draft.highlightOptions || highlights.scan?.options);
@@ -215,29 +217,31 @@
     const output = draft.signature ? draft.outputDirectory : `${batch.outputRoot || 'Downloads\\Theater Exports'}\\${cleanName}-${draft.id.slice(0, 8)}`;
     $('output-path').textContent = output; $('output-path').title = output;
     $('delivery-count').textContent = !n ? 'Choose your films' : draft.mode === 'separate' ? plural(n, 'individual ' + fileType) : draft.mode === 'combined' ? `1 ${fileType} · ${plural(n, 'chapter')}` : `${n + 1} ${fileType}s · ${n} individual + 1 reel`;
-    $('delivery-description').textContent = `${draft.outputResolution || 1440}p60 · ${draft.outputQuality || 'high'} quality · FOV ${draft.fov}° · Game audio`;
+    $('delivery-description').textContent = `${draft.outputResolution || 1440}p${draft.frameRate || 60} · ${draft.outputQuality || 'high'} quality · FOV ${draft.fov}° · Game audio`;
     // Delivery plus the active video intermediate, cached audio and its temporary capture.
     const longest = Math.max(0, ...draft.items.map(i => Math.min(i.totalTicks / 60, draft.sampleSeconds ?? Infinity)));
-    const gigabytes = ((draft.mode === 'separate' ? seconds : seconds * 2) * 50192000 + longest * 50000000 + (seconds + longest) * 192000) / 8 / 1e9;
+    const videoRate = 50000000 * (draft.frameRate || 60) / 60;
+    const gigabytes = ((draft.mode === 'separate' ? seconds : seconds * 2) * (videoRate + 192000) + longest * videoRate + (seconds + longest) * 192000) / 8 / 1e9;
     $('estimate').textContent = (draft.outputResolution || 1440) !== 1440 || (draft.outputQuality || 'high') !== 'high' ? 'File size varies with quality and scene detail.' : n ? `Approx. ${gigabytes < 1 ? `${Math.ceil(gigabytes * 1000)} MB` : `${gigabytes.toFixed(1)} GB`} disk space needed.` : '';
     $('order-note').textContent = draft.mode === 'separate' ? 'Films export in this order. Numbered filenames keep your sequence intact.' : 'This sequence becomes the chapter order in your reel.';
     $('delivery-visual').replaceChildren();
     if (draft.mode !== 'combined') for (let i = 0; i < Math.min(n, 7); i++) $('delivery-visual').append(el('i', null, 'delivery-chip'));
     if (draft.mode === 'both' && n) $('delivery-visual').append(el('span', '+', 'delivery-plus'));
     if (draft.mode !== 'separate' && n) {const joined = el('span', null, 'delivery-chip joined'); for (let i = 0; i < Math.min(n, 12); i++) joined.append(el('i'));$('delivery-visual').append(joined);}
-    let issue = !n ? 'Add at least one film to start.' : !Number.isInteger(draft.fov) || draft.fov < 55 || draft.fov > 120 ? 'Choose a FOV from 55 to 120.' : draft.sampleSeconds != null && (!Number.isFinite(draft.sampleSeconds) || draft.sampleSeconds <= 0 || draft.sampleSeconds > 43200) ? 'Choose a positive sample length up to 43200 seconds.' : !batch.toolsReady ? 'Bundled export tools are missing. Extract the complete application package again.' : singleJob && !singleJob.finished ? 'A single-film recording is active.' : '';
+    let issue = !n ? 'Add at least one film to start.' : !Number.isInteger(draft.fov) || draft.fov < 55 || draft.fov > 120 ? 'Choose a FOV from 55 to 120.' : draft.sampleSeconds != null && (!Number.isFinite(draft.sampleSeconds) || draft.sampleSeconds <= 0 || draft.sampleSeconds > 43200) ? 'Choose a positive sample length up to 43200 seconds.' : !batch.toolsReady ? 'Bundled export tools are missing. Extract the complete application package again.' : singleJob && !singleJob.finished ? 'A single-film recording is active.' : (draft.frameRate || 60) === 120 && !highlightMode() && draft.items.some(i => (i.title || 'halo3') !== 'halo3') ? '120 fps works with Halo 3 films only. Remove the other films or choose 60 fps.' : '';
     if (batch.running) issue = 'Export in progress.';
     const complete = draft.state === 'completed' && !!draft.signature;
     $('preflight').textContent = issue || (complete ? 'This job is complete. Start a new reel to export again.' : draft.signature ? 'Ready to resume.' : `${plural(n, 'film')} ready`);
     $('preflight').classList.toggle('ready', !issue);
     $('start-batch').disabled = !!issue || !!batch.running || busy || complete;
     $('start-batch').textContent = batch.running ? 'Export running…' : draft.signature ? 'Resume export' : `Start export${n ? ` · ${plural(n, 'film')}` : ''}`;
-    for (const id of ['output-resolution','output-quality','output-format','reel-name','batch-fov','capture-length','sample-seconds','continue-errors','output-folder','pick-batch','empty-add','add-all']) $(id).disabled = isLocked;
+    for (const id of ['output-resolution','output-quality','output-fps','output-format','reel-name','batch-fov','capture-length','sample-seconds','continue-errors','output-folder','pick-batch','empty-add','add-all']) $(id).disabled = isLocked;
     for (const radio of document.querySelectorAll('input[name=mode]')) radio.disabled = isLocked;
     $('new-job').disabled = isLocked;
     renderHighlights();
     const resolution = draft.outputResolution || 1440, quality = draft.outputQuality || 'high';
-    $('capture-resolution').textContent=resolution === 2160 ? '4K60 (upscaled)' : `${resolution}p60`;
+    $('capture-resolution').textContent=resolution === 2160 ? `4K${draft.frameRate || 60} (upscaled)` : `${resolution}p${draft.frameRate || 60}`;
+    $('output-fps').parentElement.hidden=false;
     $('capture-quality').textContent=quality === 'high' ? 'High quality' : 'Standard quality';
     $('output-resolution').title='';
     $('output-resolution').parentElement.hidden=false;
@@ -258,6 +262,7 @@
       $('capture-quality').textContent=quality === 'high' ? 'High quality' : 'Standard quality';
       $('output-resolution').disabled=isLocked || portrait;
       $('output-resolution').parentElement.hidden=portrait;
+      $('output-fps').parentElement.hidden=true; // highlight clips are always 60 fps
       $('output-resolution').title=portrait?'Soft focus uses a 1080×1920 portrait canvas.':'';
       $('estimate').textContent = '';
     }
@@ -365,9 +370,14 @@
   $('search').oninput = renderLibrary;
   $('pick-batch').onclick = pickFilms; $('empty-add').onclick = pickFilms; $('add-all').onclick = () => addFilms(visibleFilms());
   $('reel-name').oninput = changed;
-  for (const id of ['output-resolution','output-quality','output-format','batch-fov','capture-length','sample-seconds','continue-errors']) $(id).onchange = () => {changed();renderSequence();if(id === 'capture-length' && highlightMode()) $('highlights-panel').scrollIntoView({block:'start'});};
+  for (const id of ['output-resolution','output-quality','output-fps','output-format','batch-fov','capture-length','sample-seconds','continue-errors']) $(id).onchange = () => {changed();renderSequence();if(id === 'capture-length' && highlightMode()) $('highlights-panel').scrollIntoView({block:'start'});};
   for (const radio of document.querySelectorAll('input[name=mode]')) radio.onchange = changed;
-  $('output-folder').onclick = () => native('batch-output-folder').then(root => {batch.outputRoot = root;renderSummary();}).catch(error);
+  $('output-folder').onclick = () => native('batch-output-folder').then(state => {
+    batch = state;
+    if (draft?.signature && !state.draft?.signature) applyDraft(state.draft); // Unstarted job was moved to the new folder.
+    else if (draft?.signature) $('status').textContent = 'This job already saved films, so it keeps its folder. The new folder applies to your next reel.';
+    renderJob();renderSummary();renderSequence();
+  }).catch(error);
   $('new-job').onclick = () => {draft = fresh(); batch.job = null; $('status').textContent = '';applyDraft(draft);persist();};
   async function start(plan) {
     busy = true;clearTimeout(saveTimer);renderSummary();

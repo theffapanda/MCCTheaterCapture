@@ -39,13 +39,16 @@ DWORD* framePacing=nullptr;
 DWORD originalPacing=0;
 using FrameTime = float(*)();
 FrameTime originalFrameTime = nullptr;
+// Rendered export frames per native 60 Hz tick. At 2 (120 fps) the engine renders one
+// interpolated frame between consecutive ticks; the per-frame tick budget stays capped at one.
+std::atomic<int> framesPerTick{1};
 float ExportFrameTime() {
     const float elapsed = originalFrameTime();
     if(warming.load())return 1.0f/6.0f;
     if(!frameStep.load())return elapsed;
     if(!frameCredit.exchange(false))return 0.0f;
     ++frameSteps;
-    return 1.0f/60.0f;
+    return 1.0f/(60.0f*static_cast<float>(framesPerTick.load()));
 }
 
 bool Fail(void (*logger)(const char*, const char*), const char* detail, DWORD error = 0) {
@@ -164,6 +167,7 @@ bool InitializeNativePlaybackTiming(HMODULE module, void (*logger)(const char*, 
     return true;
 }
 
+void SetNativeExportFramesPerTick(int frames){framesPerTick=frames==2?2:1;}
 void EnableNativeFrameStep(bool enabled) {
     if(NativeTitleTimingActive()){EnableTitleFrameStep(enabled);return;}
     frameCredit=false;frameSteps=0;

@@ -37,6 +37,9 @@ internal sealed class BackgroundRecording : IDisposable
     private readonly int fov;
     private readonly bool isolatedAudioPass;
     private readonly int startTick;
+    // Output video frame rate. 120 renders one interpolated frame between each pair of 60 Hz film ticks (Halo 3 only).
+    private readonly int frameRate;
+    private int FramesPerTick=>frameRate/60;
     private readonly double? recordSeconds;
     private readonly object commandGate=new(),logGate=new();
     private readonly FileStream reservation;
@@ -52,13 +55,15 @@ internal sealed class BackgroundRecording : IDisposable
     public bool IsRunning=>!completion.Task.IsCompleted&&!status.Finished;
     public BackgroundRecordingStatus Status {get {lock(commandGate)return status;}}
 
-    public BackgroundRecording(string executable,string film,string mccRoot,string sessionDirectory,double? recordSeconds=null,string? outputFile=null,string? settingsIni=null,int fov=91,int startTick=0)
+    public BackgroundRecording(string executable,string film,string mccRoot,string sessionDirectory,double? recordSeconds=null,string? outputFile=null,string? settingsIni=null,int fov=91,int startTick=0,int frameRate=60)
     {
         this.executable=executable;this.film=film;this.mccRoot=mccRoot;this.sessionDirectory=sessionDirectory;
-        this.recordSeconds=recordSeconds;this.settingsIni=settingsIni;this.fov=fov;this.startTick=startTick;
+        this.recordSeconds=recordSeconds;this.settingsIni=settingsIni;this.fov=fov;this.startTick=startTick;this.frameRate=frameRate;
         var title=FilmTitle.Detect(film);
         isolatedAudioPass=title==FilmTitle.Halo4||title==FilmTitle.Halo2A;
         if(startTick<0||startTick>0&&(!recordSeconds.HasValue||recordSeconds<=0))throw new IOException("Ranged captures need a valid start tick and duration.");
+        if(frameRate is not (60 or 120))throw new IOException("Choose 60 or 120 fps.");
+        if(frameRate==120&&(title!=FilmTitle.Halo3||startTick>0))throw new IOException("120 fps export is available for whole Halo 3 films only.");
         Directory.CreateDirectory(sessionDirectory);
         var selected=outputFile==null?ReserveOutput(film):ReserveExactOutput(outputFile);reservation=selected.Reservation;
         status=new("preparing",selected.File,"Preparing audio and video…");
@@ -70,16 +75,17 @@ internal sealed class BackgroundRecording : IDisposable
         lock(commandGate)
         {
             double target=TargetFrames;
-            double Fraction(Pass? p)=>p?.Done==true?1:target>0?Math.Clamp((p?.Frames??0)/target,0,.99):0;
-            double? Eta(Pass? p)=>p?.Done==true?0:p?.Fps is double fps&&fps>0&&target>0?Math.Max(0,(target-p.Frames)/fps):null;
+            double Goal(Pass? p)=>p?.Audio==false?target*FramesPerTick:target; // video counts rendered frames, audio counts ticks
+            double Fraction(Pass? p)=>p?.Done==true?1:target>0?Math.Clamp((p?.Frames??0)/Goal(p),0,.99):0;
+            double? Eta(Pass? p)=>p?.Done==true?0:p?.Fps is double fps&&fps>0&&target>0?Math.Max(0,(Goal(p)-p.Frames)/fps):null;
             double? renderEta=Eta(video),audioEta=audioCached?0:Eta(audio);
             double? eta=isolatedAudioPass?(audio?.Done==true?renderEta:null):CaptureProgress.ParallelRemaining(renderEta,audioEta);
             var state=phase??(video?.State=="recording"||audio?.State=="recording"?"recording":"loading");
             var detail=message??(audio?.State=="warming"||video?.State=="warming"?"Advancing to the selected range without recording earlier footage":isolatedAudioPass&&audio?.Done!=true?"Capturing the game soundtrack before rendering video":audioCached?"Rendering video · cached audio":
                 video?.Done==true?"Video ready · capturing audio":
                 audio?.Done==true?"Audio ready · rendering video":"Capturing audio and rendering video together");
-            status=new(state,status.File,detail,(video?.Frames??0)/60.0,video?.Frames??0,video?.Dropped??0,null,
-                (int)Math.Max(0,(video?.Frames??0)-1),video?.TotalTicks??0)
+            status=new(state,status.File,detail,(video?.Frames??0)/(double)frameRate,video?.Frames??0,video?.Dropped??0,null,
+                (int)Math.Max(0,(video?.Frames??0)/FramesPerTick-1),video?.TotalTicks??0)
             {
                 Progress=target>0?Math.Min(.99,(Fraction(video)+(audioCached?1:Fraction(audio)))/2):null,
                 EstimatedSecondsRemaining=state=="recording"?eta:null,
@@ -95,6 +101,9 @@ internal sealed class BackgroundRecording : IDisposable
         string audioFile=Path.Combine(sessionDirectory,"audio-pass-"+Guid.NewGuid().ToString("N")+".mp4");
         string videoFile=Path.Combine(sessionDirectory,"video-pass-"+Guid.NewGuid().ToString("N")+".mp4");
         string muxFile=Path.Combine(Path.GetDirectoryName(status.File)!,"."+Path.GetFileNameWithoutExtension(status.File)+"-"+Guid.NewGuid().ToString("N")+".partial.mp4");
+        string? cachePath=null;
+        string syncedAudioFile=Path.Combine(sessionDirectory,"audio-synced-"+Guid.NewGuid().ToString("N")+".mp4");
+        string soundtrack=audioFile;
         try
         {
             cancellation.Token.ThrowIfCancellationRequested();
@@ -102,34 +111,52 @@ internal sealed class BackgroundRecording : IDisposable
             string ffmpeg=BatchRecording.FindTool("ffmpeg")??throw new IOException("Background export requires ffmpeg.exe for lossless stream copying.");
             if(BatchRecording.FindTool("ffprobe")==null)throw new IOException("Background export requires ffprobe.exe for validation.");
             string cache=AudioCaptureCache.PathFor(sessionDirectory,film,mccRoot,settingsIni,fov,recordSeconds,startTick,isolatedAudioPass);
-            audioCached=AudioCaptureCache.Valid(cache);
+            cachePath=cache;audioCached=AudioCaptureCache.Valid(cache);
             audio=new(true,audioCached?cache:audioFile){Done=audioCached};
+            if(audioCached)soundtrack=cache;
             video=new(false,videoFile);
             if(audioCached)Log("background-process.jsonl",JsonSerializer.Serialize(new{type="audio-cache-reused",file=cache}));
             Update();
-            var audioTask=audioCached?Task.CompletedTask:RunPass(audio,Path.Combine(sessionDirectory,"audio"),cache);
+            var audioTask=audioCached?Task.CompletedTask:RunPass(audio,Path.Combine(sessionDirectory,"audio"));
             // Legacy Wwise titles advance sound events differently when another
             // engine competes for the GPU. Finish their normal-speed soundtrack
             // with exclusive rendering before starting the frame-stepped pass.
             if(isolatedAudioPass)await audioTask;
-            var videoTask=RunPass(video,Path.Combine(sessionDirectory,"video"),null);
+            var videoTask=RunPass(video,Path.Combine(sessionDirectory,"video"));
             await Task.WhenAll(audioTask,videoTask);
             cancellation.Token.ThrowIfCancellationRequested();
+            if(!audioCached)
+            {
+                // The soundtrack is captured in real time while the video is rendered one frame per film tick.
+                // The game's tick timer drifts against the PC clock, so place the soundtrack on film ticks.
+                string ticks=audio.File+".ticks";
+                if(!File.Exists(ticks))throw new IOException("The audio pass did not record film tick timing, so the soundtrack cannot be synchronized. Rebuild the native backend.");
+                Update("finalizing","Synchronizing game audio to the film…");
+                double drift=(video.Frames/(double)FramesPerTick-audio.Frames)/60.0;
+                string resync;
+                try{resync=await BatchRecording.Execute(executable,new[]{"--resync-audio",audio.File,"--ticks",ticks,"--output",syncedAudioFile,"--frames",video.Frames.ToString(System.Globalization.CultureInfo.InvariantCulture),"--fps",frameRate.ToString(System.Globalization.CultureInfo.InvariantCulture)},cancellation.Token);}
+                catch(IOException e)when(!cancellation.IsCancellationRequested){
+                    try{File.Copy(ticks,Path.Combine(sessionDirectory,"failed-audio.ticks"),true);}catch(Exception copy)when(copy is IOException or UnauthorizedAccessException){Log("shell-errors.log",copy.Message);} // Kept for diagnosis.
+                    throw new IOException("Could not synchronize game audio to the film: "+e.Message.Replace(Path.GetFileName(executable)+" failed: ","").Trim());}
+                soundtrack=syncedAudioFile;
+                Log("background-process.jsonl",JsonSerializer.Serialize(new{type="audio-tick-synced",videoFrames=video.Frames,audioFrames=audio.Frames,driftSeconds=drift,result=resync.Trim()}));
+                try{AudioCaptureCache.Store(soundtrack,cache);}catch(Exception e)when(e is IOException or UnauthorizedAccessException){Log("shell-errors.log","Audio cache: "+e.Message);}
+            }
             Update("finalizing","Audio and video ready · combining without re-encoding…");
-            var seconds=(video.Frames/60.0).ToString("R",System.Globalization.CultureInfo.InvariantCulture);
+            var seconds=(video.Frames/(double)frameRate).ToString("R",System.Globalization.CultureInfo.InvariantCulture);
             videoPayloadHash=await VideoHash(ffmpeg,videoFile,cancellation.Token);
             // Each pass shares the selected source-frame origin. Keep timestamps
             // relative to that capture window;
             // copy compressed streams, including AAC priming information, without
             // time stretching, frame-rate conversion, or another lossy encode.
             await BatchRecording.Execute(ffmpeg,new[]{"-hide_banner","-v","error","-nostdin","-n",
-                "-i",videoFile,"-i",audio.File,"-map","0:v:0","-map","1:a:0","-c","copy",
+                "-i",videoFile,"-i",soundtrack,"-map","0:v:0","-map","1:a:0","-c","copy",
                 "-t",seconds,"-movie_timescale","48000","-movflags","+faststart",muxFile},cancellation.Token,Path.Combine(sessionDirectory,"mux.log"));
             var media=await BatchRecording.Probe(muxFile,cancellation.Token);
             if(media.Frames!=video.Frames)throw new IOException("Final MP4 frame count differs from the rendered video.");
-            await ValidateMux(muxFile,video.Frames,cancellation.Token);
+            await ValidateMux(muxFile,video.Frames,frameRate,cancellation.Token);
             if(videoPayloadHash!=await VideoHash(ffmpeg,muxFile,cancellation.Token))throw new IOException("Final MP4 changed the encoded video payload.");
-            await ValidateAudioCopy(audio.File,muxFile,cancellation.Token);
+            await ValidateAudioCopy(soundtrack,muxFile,cancellation.Token);
             cancellation.Token.ThrowIfCancellationRequested();
             File.Move(muxFile,status.File); // No overwrite, even if another application creates the destination.
             WriteFinalEvents();
@@ -138,22 +165,26 @@ internal sealed class BackgroundRecording : IDisposable
         catch(Exception failure)
         {
             error=new[]{audio?.Error,video?.Error}.FirstOrDefault(e=>!string.IsNullOrEmpty(e)&&e!="The operation was canceled."&&e!="A task was canceled.")??failure.Message;
+            // A cached soundtrack that failed final verification must not be reused by the next retry.
+            if(audioCached&&!cancelled&&cachePath!=null&&video?.Done==true)
+                foreach(string file in new[]{cachePath,cachePath+".sha256"})
+                    try{if(File.Exists(file))File.Delete(file);}catch(Exception e)when(e is IOException or UnauthorizedAccessException){Log("shell-errors.log","Audio cache: "+e.Message);}
             lock(commandGate)status=status with {State=cancelled?"cancelled":"error",Message=cancelled?"Background recording cancelled.":error,Complete=false,Cancelled=cancelled,Finished=true,EstimatedSecondsRemaining=null};
         }
         finally
         {
-            foreach(string file in new[]{audioFile,videoFile,muxFile})
+            foreach(string file in new[]{audioFile,audioFile+".ticks",syncedAudioFile,videoFile,muxFile})
                 try{if(File.Exists(file))File.Delete(file);}catch(Exception failure)when(failure is IOException or UnauthorizedAccessException){Log("shell-errors.log",failure.Message);}
             Log("background-process.jsonl",JsonSerializer.Serialize(new{type="finished",cancelled,error,utc=DateTimeOffset.UtcNow}));
             Notify();try{reservation.Dispose();}finally{completion.TrySetResult(status);}
         }
     }
-    private async Task RunPass(Pass pass,string directory,string? cache)
+    private async Task RunPass(Pass pass,string directory)
     {
         var info=new ProcessStartInfo(executable){UseShellExecute=false,CreateNoWindow=true,WorkingDirectory=Path.GetDirectoryName(executable)!,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,StandardOutputEncoding=Encoding.UTF8};
         void Arg(string name,string value){info.ArgumentList.Add(name);info.ArgumentList.Add(value);}
         Arg("--background","true");Arg("--film",film);Arg("--title",FilmTitle.Detect(film).EngineFolder);Arg("--mcc-root",mccRoot);Arg("--output",directory);Arg("--record-output",pass.File);
-        Arg(pass.Audio?"--audio-only":"--video-only","true");Arg("--fov",fov.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Arg(pass.Audio?"--audio-only":"--video-only","true");if(!pass.Audio&&frameRate!=60)Arg("--frame-rate",frameRate.ToString(System.Globalization.CultureInfo.InvariantCulture));Arg("--fov",fov.ToString(System.Globalization.CultureInfo.InvariantCulture));
         if(settingsIni!=null)Arg("--settings-ini",settingsIni);
         if(recordSeconds is >0)Arg("--record-seconds",recordSeconds.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
         if(startTick>0)Arg("--record-start-tick",startTick.ToString(System.Globalization.CultureInfo.InvariantCulture));
@@ -184,8 +215,6 @@ internal sealed class BackgroundRecording : IDisposable
             if(pass.Process.ExitCode!=0||!pass.ResultOk||!pass.Stopped||pass.Error.Length>0||pass.Frames<=0||pass.Dropped!=0||
                 (!pass.Audio&&(pass.Captured!=pass.Frames||pass.Repeated!=0))||!File.Exists(pass.File))
                 throw new IOException(pass.Error.Length>0?pass.Error:$"The {(pass.Audio?"audio":"video")} pass did not validate successfully.");
-            if(pass.Audio && cache!=null)
-                try{AudioCaptureCache.Store(pass.File,cache);}catch(Exception e)when(e is IOException or UnauthorizedAccessException){Log("shell-errors.log","Audio cache: "+e.Message);}
             lock(commandGate){pass.Done=true;Update();}
         }
         catch(Exception e)
@@ -230,7 +259,7 @@ internal sealed class BackgroundRecording : IDisposable
             }
         }
     }
-    private static async Task ValidateMux(string file,long frames,CancellationToken token)
+    private static async Task ValidateMux(string file,long frames,int frameRate,CancellationToken token)
     {
         var json=await BatchRecording.Execute(BatchRecording.FindTool("ffprobe")!,new[]{"-v","error","-show_streams","-of","json",file},token);
         using var document=JsonDocument.Parse(json);
@@ -238,10 +267,10 @@ internal sealed class BackgroundRecording : IDisposable
         var video=streams.Single(s=>s.GetProperty("codec_type").GetString()=="video");
         var audio=streams.Single(s=>s.GetProperty("codec_type").GetString()=="audio");
         double Number(JsonElement s,string key)=>double.Parse(s.GetProperty(key).ToString(),System.Globalization.CultureInfo.InvariantCulture);
-        if(Number(video,"width")!=2560||Number(video,"height")!=1440||video.GetProperty("r_frame_rate").GetString()!="60/1"||
+        if(Number(video,"width")!=2560||Number(video,"height")!=1440||video.GetProperty("r_frame_rate").GetString()!=$"{frameRate}/1"||
            video.GetProperty("profile").GetString()!="High"||Number(audio,"sample_rate")!=48000||Number(audio,"channels")!=2||
            Math.Abs(Number(video,"start_time"))>1.0/48000||Math.Abs(Number(audio,"start_time"))>1.0/48000||
-           Math.Abs(Number(video,"duration")-frames/60.0)>.001||Math.Abs(Number(audio,"duration")-frames/60.0)>.025)
+           Math.Abs(Number(video,"duration")-frames/(double)frameRate)>.001||Math.Abs(Number(audio,"duration")-frames/(double)frameRate)>.025)
             throw new IOException("Final MP4 format or audio/video duration verification failed.");
     }
     private static Task<string> VideoHash(string ffmpeg,string file,CancellationToken token)=>
@@ -265,7 +294,7 @@ internal sealed class BackgroundRecording : IDisposable
         var fields=JsonSerializer.Deserialize<Dictionary<string,JsonElement>>(video!.Recording.GetRawText())!;
         void Set(string name,object? value)=>fields[name]=JsonSerializer.SerializeToElement(value);
         Set("file",status.File);Set("path",status.File);Set("videoOnly",false);Set("audio",true);
-        Set("audioFrames",video.Frames*800);Set("audioSourceFrames",null);
+        Set("audioFrames",video.Frames*(48000/frameRate));Set("frameRate",frameRate);Set("audioSourceFrames",null);
         Set("audioGapFrames",null);Set("audioDiscontinuities",null);Set("audioNonSilentFrames",null);
         Set("audioSource","xaudio2-mastering-mix");Set("audioCached",audioCached);Set("parallelPasses",!audioCached&&!isolatedAudioPass);Set("isolatedAudioPass",isolatedAudioPass);
         Set("audioPacketCopied",true);Set("audioTimingProvenance",audioCached?"cached soundtrack; upstream gap counts unavailable":"native audio pass");
@@ -274,7 +303,7 @@ internal sealed class BackgroundRecording : IDisposable
             foreach(string key in new[]{"audioSourceFrames","audioGapFrames","audioDiscontinuities","audioNonSilentFrames"})
                 if(audio!.Recording.TryGetProperty(key,out var p))fields[key]=p;
         Log("backend-events.jsonl",JsonSerializer.Serialize(fields));
-        Log("backend-events.jsonl",JsonSerializer.Serialize(new{type="backgroundResult",ok=true,file=status.File,initialFilmTick=0,lastFilmTick=video.Frames-1,totalTicks=video.TotalTicks,windowVisible=false}));
+        Log("backend-events.jsonl",JsonSerializer.Serialize(new{type="backgroundResult",ok=true,file=status.File,initialFilmTick=0,lastFilmTick=video.Frames/FramesPerTick-1,totalTicks=video.TotalTicks,windowVisible=false}));
     }
     private async Task DrainErrors(StreamReader reader){string? line;while((line=await reader.ReadLineAsync())!=null)Log("backend-stderr.log",line);}
     private void Notify(){var handlers=Changed;if(handlers==null)return;foreach(Action<BackgroundRecordingStatus> callback in handlers.GetInvocationList())try{callback(status);}catch(Exception e){Log("shell-errors.log",e.Message);}}
@@ -375,7 +404,7 @@ internal static class BackgroundRecordingCli
             {
                 try{savedFov=JsonSerializer.Deserialize<Preferences>(File.ReadAllText(preferencesPath),new JsonSerializerOptions{PropertyNameCaseInsensitive=true})?.FovDegrees??91;}catch(JsonException){}
             }
-            using var job=new BackgroundRecording(nativeHost,film,mccRoot,session,seconds,Argument(args,"--record-output"),Program.SettingsIniPath(args),Program.FovDegrees(args,savedFov));
+            using var job=new BackgroundRecording(nativeHost,film,mccRoot,session,seconds,Argument(args,"--record-output"),Program.SettingsIniPath(args),Program.FovDegrees(args,savedFov),frameRate:int.TryParse(Argument(args,"--frame-rate"),out var fps)?fps:60);
             job.Changed+=value=>{lock(gate)events.Add(new{type="background-recording",elapsedSeconds=clock.Elapsed.TotalSeconds,utc=DateTimeOffset.UtcNow,detail=value});};
             job.Start();
             if(double.TryParse(Argument(args,"--auto-close-seconds"),System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,out var watchdog)&&watchdog>0&&await Task.WhenAny(job.Completion,Task.Delay(TimeSpan.FromSeconds(watchdog)))!=job.Completion)await job.CancelAsync();

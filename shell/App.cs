@@ -319,7 +319,18 @@ internal sealed partial class ViewerWindow : Window
                 case "batch-output-folder":
                     var outputDialog=new OpenFolderDialog{Title="Choose where batch exports will be saved",Multiselect=false};
                     if(Directory.Exists(preferences.BatchOutputRoot))outputDialog.InitialDirectory=preferences.BatchOutputRoot;
-                    if(outputDialog.ShowDialog(this)==true){preferences.BatchOutputRoot=outputDialog.FolderName;SavePreferences();}result=preferences.BatchOutputRoot;break;
+                    if(outputDialog.ShowDialog(this)==true)
+                    {
+                        preferences.BatchOutputRoot=outputDialog.FolderName;SavePreferences();
+                        // A started job freezes its destination. If it never delivered a film (e.g. it failed because the
+                        // folder was not writable), move it to a fresh draft so the new folder is actually used.
+                        if(batchRecording?.IsRunning!=true&&batchDraft.Signature.Length>0&&batchDraft.CombinedFile.Length==0&&!batchDraft.Items.Any(i=>i.State=="completed"))
+                        {
+                            batchDraft=NativeBetaDraft.Fork(batchDraft);BatchRecording.Save(DraftPath,batchDraft);
+                            batchRecording?.Dispose();batchRecording=null;
+                        }
+                    }
+                    result=BatchState();break;
                 case "batch-start":
                     var submitted=request.GetProperty("plan").Deserialize<BatchPlan>(BatchRecording.Json)??throw new IOException("Missing batch plan.");
                     await StartBatch(submitted);result=BatchState();break;

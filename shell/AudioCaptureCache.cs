@@ -17,6 +17,7 @@ internal static class AudioCaptureCache
         var identity=JsonSerializer.Serialize(new{format="native-game-audio-48k-aac-v2-multititle",film=Path.GetFullPath(film),filmHash=Hash(film),mccRoot=Path.GetFullPath(mccRoot),engines,settingsHash=File.Exists(settings)?Hash(settings):"missing",fov,seconds});
         if(startTick>0)identity+="|ranged-v1|"+startTick.ToString(System.Globalization.CultureInfo.InvariantCulture);
         if(isolatedAudioPass)identity+="|isolated-legacy-audio-qpc-v2";
+        identity+="|film-tick-synced-v2"; // Older cached soundtracks were placed on wall-clock time and can drift.
         var key=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)));
         return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(session))!,"AudioCache",key+".mp4");
     }

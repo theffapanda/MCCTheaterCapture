@@ -20,6 +20,8 @@ void ConfigureNativeOfflineRecording(const wchar_t* audioSource);
 void ConfigureNativeAudioOnlyRecording(bool enabled);
 void ConfigureNativeVideoOnlyRecording(bool enabled);
 void ConfigureNativeFrameOrigin(int firstTick);
+// Video-only offline export: 60 (default) or 120 frames per second.
+void ConfigureNativeExportFrameRate(unsigned fps);
 // Call after native scene rendering, on the immediate-context/render thread.
 // Pause time is excluded. Live recording uses asynchronous readbacks. Offline
 // export waits when its bounded GPU or encoder queue fills; every rendered image is retained.

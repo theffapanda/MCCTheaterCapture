@@ -17,6 +17,8 @@ bool InitializeNativePlaybackTiming(HMODULE module,
 // Install before engine startup; enable only after the initial frame is primed.
 bool InitializeNativeFrameStep(HMODULE module, void (*logger)(const char*, const char*));
 void EnableNativeFrameStep(bool enabled);
+// Halo 3 offline export only: 1 = 60 fps (one frame per tick), 2 = 120 fps (interpolated in-between frames).
+void SetNativeExportFramesPerTick(int frames);
 void CompleteNativeExportFrame();
 uint64_t NativeExportFrameStepCount();
 // Forward-only state warm-up. No frames/audio are recorded; native per-tick

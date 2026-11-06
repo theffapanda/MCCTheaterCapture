@@ -25,10 +25,6 @@ static_assert(offsetof(NativeEmblemDraw, emblem) == 0x30);
 static_assert(offsetof(NativeEmblemDraw, player) == 0x38);
 static_assert(offsetof(NativeEmblemDraw, tint) == 0x40);
 
-// Select the original layered shader instead of the account-based MCC path.
-// A copy keeps the engine's queued packet intact for subsequent UI passes.
-bool PrepareNativeEmblemDraw(const NativeEmblemDraw& source, NativeEmblemDraw& output);
-
 // Installs the host draw callback before engine threads start. The small ABI
 // bridge is accepted only for the pinned engine and verified bitmap call site.
 bool InitializeNativeEmblems(HMODULE module, void* host,

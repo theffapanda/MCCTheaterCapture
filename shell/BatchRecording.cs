@@ -39,6 +39,7 @@ internal sealed class BatchPlan
     public string? SettingsIni { get; set; }
     public string SettingsSnapshot { get; set; } = "";
     public int Fov { get; set; } = 91;
+    public int FrameRate { get; set; } = 60;
     public string CaptureKind { get; set; } = "full";
     public HighlightOptions? HighlightOptions { get; set; }
     public HighlightFormat HighlightFormat { get; set; } = new();
@@ -98,6 +99,7 @@ internal sealed class BatchRecording : IDisposable
         if(plan.CaptureProfile!="offline-1440p60-v2")throw new IOException("This job uses an older capture profile. Start a New reel to render every film frame at 60 fps.");
         if(plan.Mode is not ("separate" or "combined" or "both"))throw new IOException("Choose Separate MP4s, One combined MP4, or Both.");
         if(plan.Fov<55||plan.Fov>120)throw new IOException("Batch FOV must be between 55 and 120 degrees.");
+        if(plan.FrameRate is not (60 or 120))throw new IOException("Choose 60 or 120 fps.");
         if(plan.SampleSeconds.HasValue&&(!double.IsFinite(plan.SampleSeconds.Value)||plan.SampleSeconds<=0||plan.SampleSeconds>43200))throw new IOException("Sample duration must be between 0 and 43200 seconds, or null for full films.");
         if(plan.Items==null||plan.Items.Count==0||plan.Items.Count>500)throw new IOException("Choose between 1 and 500 films for this job.");
         if(string.IsNullOrWhiteSpace(plan.MccRoot))throw new IOException("Choose the installed MCC content folder before starting a batch.");
@@ -113,11 +115,13 @@ internal sealed class BatchRecording : IDisposable
             if(item.SourceBytes!=0&&(item.SourceBytes!=film.Bytes||item.SourceModified!=film.Modified))throw new IOException($"Source film changed: {film.Name}. Create a new job to capture it.");
             item.Film=film.Path;item.Name=film.Name;item.Map=film.Map;item.Title=film.Title;item.TotalTicks=film.TotalTicks;item.SourceBytes=film.Bytes;item.SourceModified=film.Modified;
         }
+        if(plan.FrameRate==120&&plan.Items.Any(i=>FilmTitle.Detect(i.Film)!=FilmTitle.Halo3))throw new IOException("120 fps export is available for Halo 3 films only. Remove the other films or choose 60 fps.");
         if(FindTool("ffmpeg")==null||FindTool("ffprobe")==null)throw new IOException("Exports need ffmpeg.exe and ffprobe.exe on PATH or in the app's tools folder to combine audio and video without re-encoding.");
         var signatureData=JsonSerializer.Serialize(new{renderRevision="native-medals-v1",plan.CaptureProfile,plan.Mode,plan.Fov,plan.SampleSeconds,plan.MccRoot,plan.OutputDirectory,plan.SettingsIni,settingsHash=plan.SettingsSnapshot.Length>0?Hash(plan.SettingsSnapshot):plan.SettingsIni!=null?Hash(plan.SettingsIni):HashDefaultSettings(),films=plan.Items.Select(i=>new{i.Film,i.SourceBytes,i.SourceModified})});
         if(plan.Items.Select(i=>i.Film).Distinct(StringComparer.OrdinalIgnoreCase).Any(film=>{var title=FilmTitle.Detect(film);return title==FilmTitle.Halo4||title==FilmTitle.Halo2A;}))signatureData+="|isolated-legacy-audio-qpc-v2";
         if(plan.Items.Select(i=>i.Film).Distinct(StringComparer.OrdinalIgnoreCase).Any(film=>{var title=FilmTitle.Detect(film);return title==FilmTitle.Halo4||title==FilmTitle.Halo2A;}))signatureData+="|native-h4-h2a-hud-fonts-v1";
         if(plan.OutputFormat!="mp4")signatureData+="|container:"+plan.OutputFormat;
+        if(plan.FrameRate!=60)signatureData+="|fps:"+plan.FrameRate;
         if(plan.OutputResolution!=1440||plan.OutputQuality!="high")signatureData+=$"|video:{plan.OutputResolution}:{plan.OutputQuality}";
         var signature=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(signatureData)));
         if(plan.Signature.Length>0&&plan.Signature!=signature)throw new IOException("This job's sources, capture settings or renderer changed. Start a New reel to avoid reusing incompatible captures.");
@@ -205,7 +209,7 @@ internal sealed class BatchRecording : IDisposable
                     var info=new FileInfo(item.Film);
                     if(info.Length!=item.SourceBytes||info.LastWriteTimeUtc.ToString("O")!=item.SourceModified)throw new IOException("The source film changed after this job started.");
                     item.State="loading";item.File=file;Publish("capturing",$"Loading {index+1} of {Plan.Items.Count}: {item.Name}");
-                    using var job=new BackgroundRecording(executable,item.Film,Plan.MccRoot,session,Plan.SampleSeconds,file,Plan.SettingsSnapshot,Plan.Fov);
+                    using var job=new BackgroundRecording(executable,item.Film,Plan.MccRoot,session,Plan.SampleSeconds,file,Plan.SettingsSnapshot,Plan.Fov,frameRate:Plan.FrameRate);
                     active=job;
                     job.Changed+=status=>
                     {
@@ -214,7 +218,7 @@ internal sealed class BatchRecording : IDisposable
                         Plan.CurrentFilmSecondsRemaining=status.EstimatedSecondsRemaining;
                         double future=0;
                         for(int next=index+1;next<Plan.Items.Count;next++)if(Plan.Items[next].State!="completed")
-                            future+=CaptureProgress.FilmWork(CaptureProgress.TargetTicks(Plan.Items[next].TotalTicks,Plan.SampleSeconds),status.VideoFramesPerSecond,audioCached[next],isolatedAudioPass[next])??double.NaN;
+                            future+=CaptureProgress.FilmWork(CaptureProgress.TargetTicks(Plan.Items[next].TotalTicks,Plan.SampleSeconds),status.VideoFramesPerSecond/(Plan.FrameRate/60),audioCached[next],isolatedAudioPass[next])??double.NaN;
                         Plan.EstimatedSecondsRemaining=status.EstimatedSecondsRemaining is double eta&&double.IsFinite(future)?eta+future:null;
                         if(Environment.TickCount64-lastProgress>400){lastProgress=Environment.TickCount64;Publish("capturing",$"{index+1} / {Plan.Items.Count} \u00b7 {item.Name} \u00b7 {status.Message}",false);}
                     };
@@ -265,7 +269,7 @@ internal sealed class BatchRecording : IDisposable
     }
     public void Dispose(){if(!IsRunning)cancellation.Dispose();}
 
-    internal sealed record MediaInfo(double Seconds,long Frames,string Signature,int Chapters,double VideoStart=0,double AudioStart=0,double AudioSeconds=0);
+    internal sealed record MediaInfo(double Seconds,long Frames,string Signature,int Chapters,double VideoStart=0,double AudioStart=0,double AudioSeconds=0,int FrameRate=60);
     internal static async Task<MediaInfo> Probe(string file,CancellationToken token)
     {
         var json=await Execute(FindTool("ffprobe")??throw new IOException("ffprobe.exe is missing."),new[]{"-v","error","-show_streams","-show_format","-show_chapters","-of","json",file},token);
@@ -280,7 +284,8 @@ internal sealed class BatchRecording : IDisposable
         if(!double.TryParse(root.GetProperty("format").GetProperty("duration").GetString(),NumberStyles.Float,CultureInfo.InvariantCulture,out var duration)||duration<=0||!long.TryParse(V(video,"nb_frames"),out var frames)||frames<=0)throw new IOException("The clip has no valid duration or frame count.");
         if(!double.TryParse(V(video,"start_time"),NumberStyles.Float,CultureInfo.InvariantCulture,out var videoStart)||!double.TryParse(V(audio,"start_time"),NumberStyles.Float,CultureInfo.InvariantCulture,out var audioStart))throw new IOException("The clip has no valid stream origins.");
         if(!double.TryParse(V(audio,"duration"),NumberStyles.Float,CultureInfo.InvariantCulture,out var audioSeconds)||!double.IsFinite(audioSeconds)||audioSeconds<=0)throw new IOException("The clip has no valid audio duration.");
-        return new(duration,frames,signature,root.TryGetProperty("chapters",out var chapters)?chapters.GetArrayLength():0,videoStart,audioStart,audioSeconds);
+        var rate=V(video,"r_frame_rate");if(rate is not ("60/1" or "120/1"))throw new IOException("The clip frame rate is not 60 or 120 fps.");
+        return new(duration,frames,signature,root.TryGetProperty("chapters",out var chapters)?chapters.GetArrayLength():0,videoStart,audioStart,audioSeconds,rate=="120/1"?120:60);
     }
     private static string MetadataText(string value)=>value.Replace("\\","\\\\").Replace("=","\\=").Replace(";","\\;").Replace("#","\\#").Replace("\r"," ").Replace("\n"," ");
     internal static async Task<bool> ReusableCombined(string file,string hash,CancellationToken token)
@@ -289,7 +294,7 @@ internal sealed class BatchRecording : IDisposable
         try{
             if(Hash(file)!=hash)return false;
             var media=await Probe(file,token);
-            return Math.Abs(media.VideoStart)<=1.0/48000&&Math.Abs(media.AudioStart)<=1.0/48000&&media.AudioSeconds+1.0/48000>=media.Frames/60.0;
+            return Math.Abs(media.VideoStart)<=1.0/48000&&Math.Abs(media.AudioStart)<=1.0/48000&&media.AudioSeconds+1.0/48000>=media.Frames/(double)media.FrameRate;
         }catch(IOException){return false;}
     }
     internal static async Task<string> Join(BatchPlan plan,CancellationToken token)
@@ -302,7 +307,7 @@ internal sealed class BatchRecording : IDisposable
         for(int i=0;i<plan.Items.Count;i++)
         {
             concat.Append("file '").Append(Path.GetFullPath(plan.Items[i].File).Replace('\\','/').Replace("'","'\\''")).Append("'\n");
-            double logicalSeconds=infos[i].Frames/60.0;
+            double logicalSeconds=infos[i].Frames/(double)infos[i].FrameRate;
             concat.Append("duration ").Append(logicalSeconds.ToString("R",CultureInfo.InvariantCulture)).Append('\n');
             chapters.Append("[CHAPTER]\nTIMEBASE=1/48000\nSTART=").Append((long)Math.Round(begin*48000)).Append("\nEND=").Append((long)Math.Round((begin+logicalSeconds)*48000)).Append("\ntitle=").Append(MetadataText(Path.GetFileNameWithoutExtension(plan.Items[i].Name))).Append('\n');begin+=logicalSeconds;
         }
@@ -314,7 +319,7 @@ internal sealed class BatchRecording : IDisposable
         var merged=await Probe(temporary,token);
         if(merged.Frames!=infos.Sum(i=>i.Frames)||Math.Abs(merged.Seconds-infos.Sum(i=>i.Seconds))>0.25+infos.Count*0.05||merged.Chapters!=plan.Items.Count)throw new IOException("Combined MP4 did not pass frame, duration and chapter validation. Source clips are kept for retry.");
         if(Math.Abs(merged.VideoStart)>1.0/48000||Math.Abs(merged.AudioStart)>1.0/48000)throw new IOException("Combined MP4 stream origins are not aligned. Source clips are kept for retry.");
-        if(merged.AudioSeconds+1.0/48000<merged.Frames/60.0)throw new IOException("Combined MP4 audio ends before its complete video sample range. Source clips are kept for retry.");
+        if(merged.AudioSeconds+1.0/48000<merged.Frames/(double)merged.FrameRate)throw new IOException("Combined MP4 audio ends before its complete video sample range. Source clips are kept for retry.");
         token.ThrowIfCancellationRequested();
         var originalTemporary=temporary;
         temporary=await DeliverContainer(temporary,plan.OutputFormat,joinFolder,token);
@@ -348,7 +353,7 @@ internal sealed class BatchRecording : IDisposable
                 throw new IOException("Export resizing did not preserve frames, audio timing or chapters. Original capture is kept.");
             using var media=JsonDocument.Parse(await Execute(FindTool("ffprobe")!,new[]{"-v","error","-select_streams","v:0","-show_streams","-of","json",temporary},token));
             var video=media.RootElement.GetProperty("streams")[0];
-            if(video.GetProperty("width").GetInt32()!=VideoWidth(resolution)||video.GetProperty("height").GetInt32()!=resolution||video.GetProperty("r_frame_rate").GetString()!="60/1")throw new IOException("Export resolution or frame rate validation failed.");
+            if(video.GetProperty("width").GetInt32()!=VideoWidth(resolution)||video.GetProperty("height").GetInt32()!=resolution||video.GetProperty("r_frame_rate").GetString()!=$"{before.FrameRate}/1")throw new IOException("Export resolution or frame rate validation failed.");
             token.ThrowIfCancellationRequested();File.Move(temporary,output,false);return output;
         }
         finally {if(File.Exists(temporary))File.Delete(temporary);}
