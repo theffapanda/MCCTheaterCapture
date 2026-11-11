@@ -38,7 +38,8 @@
 !/docs/screenshots/
 /docs/screenshots/*
 !/docs/screenshots/library.png
-!/docs/screenshots/export.jpg
+!/docs/screenshots/record.jpg
+!/docs/screenshots/auto-clipping.png
 
 !/tools/
 /tools/*

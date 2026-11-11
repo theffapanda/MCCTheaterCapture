@@ -18,7 +18,7 @@ New-Item -ItemType Directory -Force -Path $buildDocs | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/BUILD.md') -Destination $buildDocs
 $screenshots=Join-Path $buildDocs 'screenshots'
 New-Item -ItemType Directory -Force -Path $screenshots | Out-Null
-foreach ($image in @('library.png','export.jpg')) {
+foreach ($image in @('library.png','record.jpg','auto-clipping.png')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "docs/screenshots/$image") -Destination $screenshots
 }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Record-Film.ps1') -Destination (Join-Path $outputPath 'Record-Film.ps1')
