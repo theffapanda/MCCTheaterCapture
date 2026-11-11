@@ -94,12 +94,18 @@ internal sealed partial class ViewerWindow
         NativeChoice("kind","Capture length",new[]{("full","Full films"),("sample","Quick samples"),("highlights","Multikill highlights")});
         NativeInput("seconds","Sample seconds (1–43200)","10");
         NativeChoice("container","File format",new[]{("mp4","MP4"),("mov","MOV / QuickTime")});
-        NativeChoice("resolution","Resolution",new[]{("1080","1080p"),("1440","1440p / native"),("2160","4K / upscaled")});
-        NativeChoice("quality","Quality",new[]{("high","High"),("standard","Standard")});
+        NativeChoice("resolution","Resolution",new[]{("720","720p"),("1080","1080p"),("1440","1440p / native"),("2160","4K / upscaled")});
+        NativeChoice("quality","Quality",new[]{("high","High (CRF 16; original at 1440p)"),("standard","Standard (CRF 20)"),("maximum","Maximum (CRF 12)"),("custom","Custom CRF")});
+        NativeInput("crf","Custom CRF (0–51, lower = better)","18");
+        NativeChoice("preset","Encoder speed (re-encodes)",ExportEncoding.Presets.Select(p=>(p,p=="ultrafast"?p+" (largest files)":p=="veryslow"?p+" (smallest files)":p=="fast"?p+" (default)":p)).ToArray());
+        NativeChoice("tune","Encoder tune",ExportEncoding.Tunes.Select(t=>(t,t=="none"?"None (default)":t)).ToArray());
+        NativeChoice("bitrate","Capture bitrate (at 60 fps)",ExportEncoding.CaptureBitrates.Select(b=>(b.ToString(CultureInfo.InvariantCulture),b+" Mbps"+(b==50?" (default)":""))).ToArray());
+        NativeChoice("keyframe","Capture keyframe interval",new[]{("0.5","0.5 s (default)"),("1","1 s"),("2","2 s")});
+        NativeChoice("audio","Highlight audio bitrate",ExportEncoding.AudioBitrates.Select(b=>(b.ToString(CultureInfo.InvariantCulture),b+" kbps"+(b==192?" (default)":""))).ToArray());
         NativeInput("fov","Field of view (55–120)","91");
         nativeSettings.Children.Add(nativeContinue);nativeEditControls.Add(nativeContinue);
         nativeContinue.Click+=(_,_)=>NativeEditChanged();
-        nativeSettings.Children.Add(Text("Game audio included · 60 fps",12));
+        nativeSettings.Children.Add(Text("Game audio included · 1440p + High keeps the original capture; other choices re-encode with x264",12));
         nativeSettings.Children.Add(NativeAction("Save folder…",NativePickDestination,true));nativeSettings.Children.Add(nativeDestination);
         nativeStart=NativeAction("Start export",()=>NativeStartExport(false));nativeSettings.Children.Add(nativeStart);
         nativeSettings.Children.Add(Text("Beta settings and jobs are kept in BetaUserData. Stable release data stays separate.",11));
@@ -141,6 +147,7 @@ internal sealed partial class ViewerWindow
             NativeAction("Move down",()=>NativeMoveSequence(nativeSequence.SelectedIndex,nativeSequence.SelectedIndex+1),true),NativeAction("Remove selected",NativeRemoveFilms,true),
             NativeAction("Play selected",async()=>{if(nativeSequence.SelectedItem is BatchItem film)await OpenRecording(film.Film);})),nativeSequence,Text("Drag rows or use Move up / Move down to arrange the sequence.",12))});
         BuildNativeHighlights();
+        BuildNativeMonitoring();
         nativeTabs.Items.Add(new TabItem {Header="Exports",Content=BuildNativeExports()});
         root.AllowDrop=true;root.DragOver+=(_,e)=>{if(e.Data.GetDataPresent(DataFormats.FileDrop)){e.Effects=NativeLocked?DragDropEffects.None:DragDropEffects.Copy;e.Handled=true;}};
         root.Drop+=(_,e)=>{if(!e.Data.GetDataPresent(DataFormats.FileDrop))return;try{NativeImport((string[])e.Data.GetData(DataFormats.FileDrop));e.Handled=true;}catch(Exception error){NativeError(error);}};
@@ -175,13 +182,16 @@ internal sealed partial class ViewerWindow
     private void NativeReadDraft()
     {
         // Parse before mutating or forking, so partially entered numbers cannot corrupt a job.
-        int fov=NativeInteger("fov",55,120), minimum=NativeInteger("minimum",2,10);
+        int fov=NativeInteger("fov",55,120), minimum=NativeInteger("minimum",2,10), crf=NativeInteger("crf",0,51);
+        var encoding=new ExportEncoding{Crf=crf,Preset=NativeValue("preset"),Tune=NativeValue("tune"),CaptureBitrateMbps=int.Parse(NativeValue("bitrate"),CultureInfo.InvariantCulture),
+            KeyframeSeconds=double.Parse(NativeValue("keyframe"),CultureInfo.InvariantCulture),AudioBitrateKbps=int.Parse(NativeValue("audio"),CultureInfo.InvariantCulture)};
+        encoding.Validate();
         double before=NativeNumber("before",0,30),after=NativeNumber("after",0,30);
         double? seconds=NativeValue("kind")=="sample"?NativeNumber("seconds",1,43200):null;
         var format=new HighlightFormat {Layout=NativeValue("layout"),Blur=NativeInteger("blur",0,40),Dim=NativeInteger("dim",0,80),GameplayPosition=NativeInteger("position",30,65)};
         format.Validate();NativeBeginEdit();
         batchDraft.Name=nativeInputs["name"].Text;batchDraft.Mode=NativeValue("mode");batchDraft.OutputFormat=NativeValue("container");
-        batchDraft.OutputResolution=int.Parse(NativeValue("resolution"),CultureInfo.InvariantCulture);batchDraft.OutputQuality=NativeValue("quality");
+        batchDraft.OutputResolution=int.Parse(NativeValue("resolution"),CultureInfo.InvariantCulture);batchDraft.OutputQuality=NativeValue("quality");batchDraft.Encoding=encoding;
         batchDraft.Fov=fov;batchDraft.CaptureKind=NativeValue("kind");batchDraft.SampleSeconds=seconds;batchDraft.ContinueOnError=nativeContinue.IsChecked==true;
         batchDraft.HighlightOptions=new(){MinimumKills=minimum,BeforeSeconds=before,AfterSeconds=after,Exact=nativeExact.IsChecked==true,Selection=NativeValue("scope")};
         batchDraft.HighlightFormat=format;
@@ -200,6 +210,8 @@ internal sealed partial class ViewerWindow
             nativeInputs["seconds"].Text=(batchDraft.SampleSeconds??10).ToString(CultureInfo.InvariantCulture);
             NativeSet("mode",batchDraft.Mode);NativeSet("kind",batchDraft.CaptureKind);NativeSet("container",batchDraft.OutputFormat);
             NativeSet("resolution",batchDraft.OutputResolution.ToString(CultureInfo.InvariantCulture));NativeSet("quality",batchDraft.OutputQuality);
+            var encoding=batchDraft.Encoding??new();nativeInputs["crf"].Text=encoding.Crf.ToString(CultureInfo.InvariantCulture);NativeSet("preset",encoding.Preset);NativeSet("tune",encoding.Tune);
+            NativeSet("bitrate",encoding.CaptureBitrateMbps.ToString(CultureInfo.InvariantCulture));NativeSet("keyframe",encoding.KeyframeSeconds.ToString(CultureInfo.InvariantCulture));NativeSet("audio",encoding.AudioBitrateKbps.ToString(CultureInfo.InvariantCulture));
             nativeContinue.IsChecked=batchDraft.ContinueOnError;
             var options=batchDraft.HighlightOptions??new();nativeInputs["minimum"].Text=options.MinimumKills.ToString();nativeInputs["before"].Text=options.BeforeSeconds.ToString(CultureInfo.InvariantCulture);
             nativeInputs["after"].Text=options.AfterSeconds.ToString(CultureInfo.InvariantCulture);nativeExact.IsChecked=options.Exact;NativeSet("scope",options.Selection);
@@ -326,7 +338,7 @@ internal sealed partial class ViewerWindow
         if(!NativeBetaDraft.ScanMatches(highlightScan,batchDraft))throw new IOException("The sequence or scan options changed. Find multikills again before exporting.");
         var selected=highlightScan!.Clips.Where(c=>c.Selected).Select(c=>c.Id).ToArray();if(selected.Length==0)throw new IOException("Select at least one highlight clip.");
         return JsonSerializer.SerializeToElement(new{type,ids=selected,name=batchDraft.Name,mode=batchDraft.Mode,fov=batchDraft.Fov,continueOnError=batchDraft.ContinueOnError,
-            outputFormat=batchDraft.OutputFormat,outputResolution=batchDraft.OutputResolution,outputQuality=batchDraft.OutputQuality,format=batchDraft.HighlightFormat,captions=batchDraft.HighlightCaptions,preview},Json);
+            outputFormat=batchDraft.OutputFormat,outputResolution=batchDraft.OutputResolution,outputQuality=batchDraft.OutputQuality,encoding=batchDraft.Encoding,format=batchDraft.HighlightFormat,captions=batchDraft.HighlightCaptions,preview},Json);
     }
     private void NativeSaveJob(bool highlights)
     {

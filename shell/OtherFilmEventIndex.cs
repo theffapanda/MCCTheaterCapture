@@ -91,7 +91,7 @@ internal static class OtherFilmEventIndex
         // string table on every scan. Halo 3's v1 cache is never consulted.
         var index = new FilmIndex { Title = title.Id, Film = path, Hash = FilmEventIndex.ContentHash(input, token), Map = metadata.Map, TotalTicks = metadata.TotalTicks };
         var roster = Roster(header.Bytes, title);
-        input.Position = 0; byte[] chunk = new byte[12]; long dataStart = -1, dataEnd = -1; string author = ""; bool filmHeader = false;
+        input.Position = 0; byte[] chunk = new byte[12]; long dataStart = -1, dataEnd = -1; string author = "", authorName = ""; bool filmHeader = false;
         for (int count = 0; count < 64 && input.Position < input.Length; count++)
         {
             long start = input.Position; input.ReadExactly(chunk); string tag = Encoding.ASCII.GetString(chunk, 0, 4);
@@ -108,12 +108,20 @@ internal static class OtherFilmEventIndex
                 if (size < 0x58 || author.Length != 0) throw new IOException("Invalid title film author header.");
                 byte[] bytes = new byte[size]; chunk.CopyTo(bytes, 0); input.ReadExactly(bytes.AsSpan(12));
                 author = Convert.ToHexString(bytes.AsSpan(0x50, 8)).ToLowerInvariant();
+                authorName = Encoding.ASCII.GetString(bytes, 0x58, 16).Split('\0')[0];
+                if (authorName.Length == 0 || authorName.Any(char.IsControl)) authorName = author;
             }
             if (tag == "flmd") { dataStart = start + 16; dataEnd = start + extent; break; }
             input.Position = start + extent;
         }
         var recorder = roster.Values.Where(p => p.Identifier == author).ToArray();
-        if (recorder.Length != 1 || author == "0000000000000000") throw new IOException("Film author does not identify exactly one recording player.");
+        if (author.Length == 0 || author == "0000000000000000") throw new IOException("Film has no author identity to resolve the recording player.");
+        // Highlights follow the recording player only. A film saved by an
+        // account absent from the starting roster (e.g. not in the match, or
+        // joined after start) has no recorder events to plan clips from.
+        if (recorder.Length == 0)
+            throw new IOException($"The account that saved this film ({authorName}) was not a player in it. Players: {string.Join(", ", roster.Values.Select(p => p.Name))}.");
+        if (recorder.Length != 1) throw new IOException("Film author does not identify exactly one recording player.");
         index.Recorder = recorder[0].Name;
         if (dataStart < 0) throw new IOException("Title film has no update stream.");
         input.Position = dataStart; int update = 0, segment = 0; byte[] packed = new byte[4];

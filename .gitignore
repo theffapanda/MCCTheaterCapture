@@ -48,6 +48,14 @@
 !/tools/Build-MinimalFFmpeg.sh
 !/tools/Export-FFmpegSource.ps1
 
+# Monitoring regression fixtures are synthetic; personal sample films stay ignored.
+!/tests/
+/tests/*
+!/tests/Monitoring/
+/tests/Monitoring/*
+!/tests/Monitoring/*.cs
+!/tests/Monitoring/*.csproj
+
 # Small runtime libraries and exact FFmpeg sources used by packaging.
 # Supply the full WebView2 browser runtime separately when packaging.
 !/deps/

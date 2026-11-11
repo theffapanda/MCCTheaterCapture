@@ -29,15 +29,18 @@ using Microsoft::WRL::ComPtr;
 namespace {
 // High-motion upload master. Keep 60 progressive frames and give fast camera
 // pans, particles and foliage more headroom before YouTube's own transcode.
-constexpr UINT kWidth=2560,kHeight=1440,kFps=60,kBitrate=50000000;
+constexpr UINT kWidth=2560,kHeight=1440,kFps=60;
 constexpr UINT kQualityVsSpeed=100;
 constexpr const char* kEncodingProfile="youtube-fast-1440p60-v1";
 // Video-only offline export frame rate (60, or 120 for Halo 3 interpolated frames). Bitrate scales with it so
 // per-frame quality matches the 60 fps profile. Real-time and audio paths stay on the 60 Hz tick clock (kFps).
 UINT exportFps=60;
+// User-selectable: target bitrate at 60 fps (default 50 Mbps) and keyframe interval in half seconds (default 0.5 s).
+UINT baseBitrate=50000000,keyframeHalfSeconds=1;
 UINT VideoFps(){return exportFps;}
-UINT VideoBitrate(){return kBitrate*(exportFps/kFps);}
-UINT VideoGop(){return exportFps/2;}
+UINT VideoBitrate(){return baseBitrate*(exportFps/kFps);}
+UINT VideoGop(){return exportFps*keyframeHalfSeconds/2;}
+std::string BitrateText(){return std::to_string(VideoBitrate()/1000000)+" Mbps";}
 constexpr UINT kAudioRate=48000,kAudioChannels=2,kAudioBitrate=192000;
 constexpr size_t kPoolFrames=8,kGpuFrames=4;
 constexpr LONGLONG kTimeBase=10000000;
@@ -137,7 +140,7 @@ void ConfigureEncoder(IMFSinkWriter* writer,DWORD stream){
     {std::lock_guard<std::mutex> lock(g.mutex);g.qualityVsSpeed=g.gopFrames=g.rateControlMode=g.cabac=-1;}
     ComPtr<ICodecAPI> codec;
     const HRESULT service=writer->GetServiceForStream(stream,GUID_NULL,IID_PPV_ARGS(&codec));
-    if(FAILED(service)){Log("native_recording_encoder_options","ICodecAPI unavailable "+Result(service)+"; 50 Mbps media type remains in effect");return;}
+    if(FAILED(service)){Log("native_recording_encoder_options","ICodecAPI unavailable "+Result(service)+"; "+BitrateText()+" media type remains in effect");return;}
     // Optional driver controls must never prevent capture. Log the result and
     // only report effective values when the encoder can read them back.
     auto option=[&](const GUID& key,const char* name,ULONG requested,int& effective,bool boolean=false){
@@ -185,7 +188,7 @@ HRESULT CreateWriter(IMFByteStream* bytes,bool hardware,ComPtr<IMFSinkWriter>& w
     if(SUCCEEDED(hr)){
         hr=writer->SetInputMediaType(stream,input.Get(),encoding.Get());
         if(FAILED(hr)){
-            Log("native_recording_encoder_options","Driver rejected optional initialization controls "+Result(hr)+"; retrying 50 Mbps media type");
+            Log("native_recording_encoder_options","Driver rejected optional initialization controls "+Result(hr)+"; retrying "+BitrateText()+" media type");
             hr=writer->SetInputMediaType(stream,input.Get(),nullptr);
         }
     }
@@ -383,7 +386,7 @@ void EncodeSession(){
         std::deque<std::unique_ptr<Frame>> pool;
         if(!audioOnly)for(size_t n=0;n<kPoolFrames;++n){auto frame=std::make_unique<Frame>();frame->bgra.resize(static_cast<size_t>(kWidth)*kHeight*4);pool.push_back(std::move(frame));}
         {std::lock_guard<std::mutex> lock(g.mutex);g.pool=std::move(pool);g.encoderReady=true;g.phase=g.stop?"stopping":"recording";}
-        g.cv.notify_all();Log("native_recording_started",Utf8(path)+(audioOnly?"; audio-only game soundtrack; AAC 48000 Hz stereo 192000 bps":"; YouTube HQ fast gameplay; native 2560x1440 60 fps H.264 50000000 bps target; process-only AAC 48000 Hz stereo 192000 bps"));
+        g.cv.notify_all();Log("native_recording_started",Utf8(path)+(audioOnly?std::string("; audio-only game soundtrack; AAC 48000 Hz stereo 192000 bps"):"; native 2560x1440 "+std::to_string(VideoFps())+" fps H.264 "+std::to_string(VideoBitrate())+" bps target, GOP "+std::to_string(VideoGop())+" frames; process-only AAC 48000 Hz stereo 192000 bps"));
         std::unique_ptr<Frame> previous;uint64_t next=0;
         while(true){
             std::unique_ptr<Frame> frame;
@@ -500,6 +503,8 @@ void ConfigureNativeAudioOnlyRecording(bool enabled){audioOnly=enabled;}
 void ConfigureNativeVideoOnlyRecording(bool enabled){videoOnly=enabled;}
 void ConfigureNativeFrameOrigin(int firstTick){configuredFrameOrigin=firstTick;}
 void ConfigureNativeExportFrameRate(unsigned fps){exportFps=fps==120?120:60;}
+void ConfigureNativeVideoBitrate(unsigned mbps){if(mbps>=10&&mbps<=150)baseBitrate=mbps*1000000u;}
+void ConfigureNativeKeyframeInterval(unsigned halfSeconds){if(halfSeconds>=1&&halfSeconds<=8)keyframeHalfSeconds=halfSeconds;}
 void NativeRecorderFrame(IDXGISwapChain* chain,int filmTick,bool paused){
     uint64_t generation=0;bool ready=false,stop=false,failed=false,closed=false;
     ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;

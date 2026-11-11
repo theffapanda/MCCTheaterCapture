@@ -114,6 +114,15 @@ static const s_font_character *rasterize(const char *name, int size, float scale
     auto it = g_chars.find(k);
     if (it != g_chars.end()) return &it->second;
     if (c >= 0xE000 && c <= 0xE2FF) return nullptr; // icons come from the game
+    // Control characters (e.g. the CR in "Hold <button> to swap for\r\n<weapon>")
+    // have no font glyph. Report them as valid, empty and zero-advance; otherwise
+    // font_test_string rejects the whole string and the HUD prompt is never drawn.
+    if (c < 0x20)
+    {
+        s_font_character ch = {};
+        ch.unicode = c; ch.scale = scale; ch.valid = 1;
+        return &(g_chars[k] = ch);
+    }
 
     NativeFontGlyph glyph;
     if(!NativeFontAssetGlyph(name,size,scale,c,glyph))return nullptr;

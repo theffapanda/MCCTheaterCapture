@@ -10,7 +10,12 @@
 #include "NativePlayers.h"
 #include "NativeHud.h"
 #include "NativeHudServices.h"
+#include "NativeSkinItems.h"
+#include "NativeSkinTextures.h"
 #include <algorithm>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -93,6 +98,78 @@ uint64_t Unknown(void*, uint64_t a, uint64_t b, uint64_t c)
     // Upstream uses zero-return logging stubs for unresolved slots. A log is never
     // evidence the requested service was implemented or that a frame was rendered.
     return 0;
+}
+
+bool SafeRead(uint64_t address, void* output, size_t size)
+{
+    if (address < 0x10000) return false;
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size, &got) && got == size;
+}
+
+// Slot 110: MCC host RVA 1E8624 hashes the engine's skin tag name and returns
+// the MCC customization item mapped by careerdb <Halo3><SkinItems>, or -1.
+// Halo 3 stores the value per skin record and matches it against each
+// player's recorded selection (e.g. Elite techsuits, visors, weapon skins).
+std::vector<std::pair<std::string,int>> skinItems;
+void LoadSkinItems()
+{
+    const auto file = std::filesystem::path(env->mccRoot) / L"data" / L"careerdb" / L"careerdb.xml";
+    std::ifstream input(file, std::ios::binary);
+    if (!input) { Log("native_skin_items", "careerdb.xml not found; MCC skins and armor variants stay default"); return; }
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const size_t section = text.find("<Halo3>");
+    const size_t sectionEnd = section == std::string::npos ? section : text.find("</Halo3>", section);
+    const size_t begin = section == std::string::npos ? section : text.find("<SkinItems>", section);
+    const size_t end = begin == std::string::npos ? begin : text.find("</SkinItems>", begin);
+    if (begin == std::string::npos || end == std::string::npos || end > sectionEnd)
+    {
+        Log("native_skin_items", "careerdb Halo3 SkinItems not found; MCC skins and armor variants stay default"); return;
+    }
+    auto attribute = [&](size_t from, size_t to, const char* name) -> std::string {
+        const std::string key = std::string(name) + "=\"";
+        const size_t at = text.find(key, from);
+        if (at == std::string::npos || at >= to) return {};
+        const size_t value = at + key.size(), close = text.find('"', value);
+        return close == std::string::npos || close > to ? std::string{} : text.substr(value, close - value);
+    };
+    size_t unknown = 0;
+    for (size_t at = text.find("<Skin ", begin); at != std::string::npos && at < end; at = text.find("<Skin ", at + 1))
+    {
+        const size_t close = text.find("/>", at);
+        if (close == std::string::npos || close > end) break;
+        const std::string item = attribute(at, close, "customizationItem"), tag = attribute(at, close, "tagName");
+        if (item.empty() || tag.empty()) continue;
+        const auto known = std::find_if(std::begin(kNativeSkinItems), std::end(kNativeSkinItems),
+            [&](const NativeSkinItem& entry) { return item == entry.name; });
+        if (known == std::end(kNativeSkinItems)) { ++unknown; continue; }
+        skinItems.emplace_back(tag, known->value);
+    }
+    char detail[160];
+    std::snprintf(detail, sizeof(detail), "careerdb Halo3 SkinItems mapped=%zu unknownItems=%zu", skinItems.size(), unknown);
+    Log("native_skin_items", detail);
+}
+int SkinItem(void*, const char* tag)
+{
+    Call(110);
+    if (!tag) return -1;
+    char name[33]{};
+    if (!SafeRead(reinterpret_cast<uint64_t>(tag), name, 32)) return -1;
+    for (const auto& [key, value] : skinItems)
+        if (_stricmp(key.c_str(), name) == 0) return value;
+    return -1;
+}
+
+// Slot 71 get_player_skin(item, variant) -> ID3D11ShaderResourceView* owned by
+// the engine. The device comes from halo3's immediate context global
+// (image+0x46BB828, the same pointer 27B132 calls SetResourceMinLOD on).
+void* PlayerSkin(void*, int item, int variant)
+{
+    Call(71);
+    static const auto base = reinterpret_cast<uint64_t>(GetModuleHandleW(L"halo3.dll"));
+    uint64_t context = 0;
+    if (!base || !SafeRead(base + 0x46BB828, &context, sizeof(context)) || !context) return nullptr;
+    return skin_textures::Load(env->mccRoot, reinterpret_cast<ID3D11DeviceContext*>(context), item, variant, Log);
 }
 
 template<bool Event, size_t... I>
@@ -429,6 +506,10 @@ void InitializeProfile()
     Put<int32_t>(0x14, env->viewSettings.fovDegrees);
     Put<int32_t>(0x18, env->viewSettings.vehicleFovDegrees);
     profile[0x1c] = 1;
+    // halo3.dll 27AB6C: profile[0x3B]==0 sets 182285B2F, and 28AF2B then
+    // disables MCC skins (weapon/vehicle/armor/visor) for films whose game
+    // options lack an MCC session marker. Nonzero keeps recorded skins enabled.
+    profile[0x3b] = 1;
     // Retail 2F7FA6..2F7FDA maps host medal option 0/2 -> disabled (2),
     // 1 -> original (0), 3 -> all (1), at controller preferences +0x204.
     // A zero-filled private profile therefore hides every native medal icon.
@@ -478,11 +559,12 @@ void* CreateReplayHostServices(const ReplayHostEnvironment& environment)
     SET(66, FontIcon); SET(67, FontSelection); SET(75, WeaponOffset);
     SET(84, Split84); SET(85, Split85); SET(86, Split86);
     SET(88, PlayerXuid); SET(97, HudColor); SET(115, GraphicsSwitch); SET(116, Mapping);
+    SET(71, PlayerSkin); SET(110, SkinItem);
 #undef SET
     InstallNativeFontCallbacks(hostTable.data());
     InitializeNativeHudServices(environment.log);
     InstallNativeHudServiceCallbacks(hostTable.data());
-    InitializeProfile(); LoadCampaign();
+    InitializeProfile(); LoadCampaign(); LoadSkinItems();
     for (const wchar_t* name : {L"logs", L"config", L"temp"})
     {
         std::error_code error;

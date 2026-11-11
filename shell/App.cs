@@ -151,6 +151,7 @@ internal sealed partial class ViewerWindow : Window
         if (Argument("--maps") is string maps) preferences.Maps = Path.GetFullPath(maps);
         if (Argument("--mcc-root") is string mcc) preferences.Maps = FilmTitle.InstallationRoot(mcc);
         if (!Directory.Exists(preferences.Maps)) preferences.Maps = FindMaps() ?? "";
+        InitializeMonitoring();
         Title = "MCC Theater Capture"; Width=1600; Height=1000; MinWidth=1000; MinHeight=680;
 #if NATIVE_UI_BETA
         Title += " — Native UI Beta";
@@ -208,6 +209,7 @@ internal sealed partial class ViewerWindow : Window
             e.Cancel=true;
             if(closing)return;
             closing=true; IsEnabled=false;
+            try { await StopMonitoring(); } catch(Exception error) { Record("monitor-stop-error",new{error.Message}); }
             resourceTimer.Stop();
             if(resourceSample!=null)try{await resourceSample;}catch(Exception){}
             resourceMonitor.Dispose();
@@ -280,11 +282,13 @@ internal sealed partial class ViewerWindow : Window
             var artworkCache=Path.Combine(dataRoot,"MapArtwork");
             Directory.CreateDirectory(artworkCache);
             core.SetVirtualHostNameToFolderMapping(MapArtwork.Host,artworkCache,CoreWebView2HostResourceAccessKind.DenyCors);
+            RegisterAutoClipStreaming(core);
             core.WebMessageReceived+=MessageReceived;
             core.NavigationStarting+=(_,e)=> { if(!e.Uri.StartsWith(Origin+"/",StringComparison.OrdinalIgnoreCase))e.Cancel=true; };
             core.NewWindowRequested+=(_,e)=>e.Handled=true;
             ready=true; await ShowLibrary(); Record("library-ready");
 #endif
+            StartMonitoring();
             if(Argument("--film") is string film)await OpenRecording(film);
             if(double.TryParse(Argument("--auto-close-seconds"),System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,out var seconds)&&seconds>0)
             {
@@ -305,6 +309,10 @@ internal sealed partial class ViewerWindow : Window
             id=request.GetProperty("id").GetInt32(); object? result=null;
             switch(request.GetProperty("type").GetString())
             {
+                case "monitor-settings": case "monitor-export": case "monitor-cancel": case "monitor-folder": case "monitor-archive": case "monitor-retry-scan": case "monitor-dismiss": case "monitor-open-clip":
+                    result=await MonitoringMessage(request);break;
+                case "autoclips-list": case "autoclips-folder": case "autoclips-open": case "autoclips-watch": case "autoclips-reveal": case "autoclips-rename": case "autoclips-delete":
+                    result=await AutoClipMessage(request);break;
                 case "highlights-state": case "highlights-scan": case "highlights-cancel-scan": case "highlights-start": case "highlights-save": case "highlights-retry": case "highlights-cancel": case "highlights-load": case "highlights-open-folder": case "highlights-open-clip":
                     result=await HighlightMessage(request);break;
                 case "catalog": result=Catalog(); break;
@@ -356,7 +364,9 @@ internal sealed partial class ViewerWindow : Window
                 case "background-recording-preference":preferences.BackgroundRecording=request.GetProperty("enabled").GetBoolean();SavePreferences();break;
                 case "background-cancel":if(backgroundRecording?.IsRunning==true)await backgroundRecording.CancelAsync();break;
                 case "background-open-folder":backgroundRecording?.OpenFolder();break;
-                case "open-film": if(!recordings.TryGetValue(request.GetProperty("filmId").GetString()!,out var film))throw new IOException("The recording is no longer available."); await OpenRecording(film.Path); break;
+                case "open-film": if(!recordings.TryGetValue(request.GetProperty("filmId").GetString()!,out var film))throw new IOException("The recording is no longer available.");
+                    // preview=true always opens interactive playback, even when "Export directly to file" is on.
+                    await OpenRecording(film.Path,request.TryGetProperty("preview",out var preview)&&preview.ValueKind==JsonValueKind.True); break;
                 default: throw new IOException("Unknown capture action.");
             }
             if(!closing)browser.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new{id,ok=true,data=result},Json));
@@ -394,7 +404,7 @@ internal sealed partial class ViewerWindow : Window
         if(playback!=null){body.Children.Remove(playback);playback=null;}playersPane=null;
     }
 
-    private async Task OpenRecording(string path)
+    private async Task OpenRecording(string path,bool forcePlayback=false)
     {
         if(HighlightRunning)throw new IOException("Finish the highlight scan or export before opening playback.");
         if(!ready||switching||closing)return;
@@ -405,7 +415,7 @@ internal sealed partial class ViewerWindow : Window
         if(Argument("--title") is string requestedTitle&&FilmTitle.FromId(requestedTitle).Id!=film.Title)throw new IOException("The requested title does not match the film header.");
         if(!film.CanDecode)throw new IOException(film.Reason);
         if(!File.Exists(nativeHost))throw new FileNotFoundException("Build the native proof of concept before opening a recording.",nativeHost);
-        if(preferences.BackgroundRecording){await StartBackgroundRecording(film);return;}
+        if(preferences.BackgroundRecording&&!forcePlayback){await StartBackgroundRecording(film);return;}
         switching=true;
         try
         {
@@ -427,6 +437,7 @@ internal sealed partial class ViewerWindow : Window
 
     private async Task StartBackgroundRecording(Recording film)
     {
+        if(MonitorExportRunning)throw new IOException("Pause the automatic clip export before starting another recording.");
         await ShowLibrary();current=film;
         preferences.Recent.RemoveAll(path=>string.Equals(path,film.Path,StringComparison.OrdinalIgnoreCase));preferences.Recent.Insert(0,film.Path);preferences.Recent=preferences.Recent.Take(30).ToList();SavePreferences();
         var mccRoot=FilmTitle.InstallationRoot(preferences.Maps);
@@ -937,7 +948,7 @@ internal sealed partial class ViewerWindow : Window
             catch(Exception error) when(error is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
             { artwork=new();Record("map-artwork-unavailable",new{message=error.Message}); }
         }
-        return new{movies=preferences.Movies,maps=preferences.Maps,artwork,films=films.OrderByDescending(f=>f.Modified).Select(f=>new{f.Id,f.Name,f.Map,f.Path,f.TotalTicks,f.Bytes,f.Modified,f.CanDecode,f.Reason,f.GameType,f.GameVariantName,f.Duration,f.Title,f.TitleName,f.ArtworkKey}),desktop=true,backgroundRecording=preferences.BackgroundRecording,job=backgroundStatus,batch=BatchState(),highlights=HighlightsState()};
+        return new{movies=preferences.Movies,maps=preferences.Maps,artwork,films=films.OrderByDescending(f=>f.Modified).Select(f=>new{f.Id,f.Name,f.Map,f.Path,f.TotalTicks,f.Bytes,f.Modified,f.CanDecode,f.Reason,f.GameType,f.GameVariantName,f.Duration,f.Title,f.TitleName,f.ArtworkKey}),desktop=true,backgroundRecording=preferences.BackgroundRecording,job=backgroundStatus,batch=BatchState(),highlights=HighlightsState(),monitoring=MonitoringState()};
     }
     private string? PickFilm()
     {

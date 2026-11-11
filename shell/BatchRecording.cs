@@ -24,6 +24,53 @@ internal sealed class BatchItem
     public double DurationSeconds { get; set; }
 }
 
+// User-adjustable encoder levers. Defaults reproduce the original fixed profile,
+// so jobs and caches created before these settings existed keep their signatures.
+internal sealed class ExportEncoding
+{
+    internal static readonly int[] CaptureBitrates = { 25, 35, 50, 80, 100, 150 };
+    internal static readonly double[] KeyframeIntervals = { .5, 1, 2 };
+    internal static readonly string[] Presets = { "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow" };
+    internal static readonly string[] Tunes = { "none", "film", "animation", "grain" };
+    internal static readonly int[] AudioBitrates = { 128, 192, 256, 320 };
+    // Native Media Foundation H.264 target at 60 fps (doubled for 120 fps).
+    public int CaptureBitrateMbps { get; set; } = 50;
+    // Native capture keyframe spacing in seconds.
+    public double KeyframeSeconds { get; set; } = .5;
+    // x264 CRF used when quality is "custom" (0 = lossless, 51 = worst).
+    public int Crf { get; set; } = 18;
+    public string Preset { get; set; } = "fast";
+    public string Tune { get; set; } = "none";
+    // AAC bitrate for re-encoded highlight clip audio.
+    public int AudioBitrateKbps { get; set; } = 192;
+
+    public void Validate()
+    {
+        if (!CaptureBitrates.Contains(CaptureBitrateMbps)) throw new IOException("Choose a capture bitrate of " + string.Join(", ", CaptureBitrates) + " Mbps.");
+        if (!KeyframeIntervals.Contains(KeyframeSeconds)) throw new IOException("Choose a keyframe interval of 0.5, 1 or 2 seconds.");
+        if (Crf is < 0 or > 51) throw new IOException("Custom CRF must be between 0 and 51.");
+        if (!Presets.Contains(Preset)) throw new IOException("Choose an x264 encoder speed preset.");
+        if (!Tunes.Contains(Tune)) throw new IOException("Choose an x264 tune.");
+        if (!AudioBitrates.Contains(AudioBitrateKbps)) throw new IOException("Choose an audio bitrate of " + string.Join(", ", AudioBitrates) + " kbps.");
+    }
+    public bool CaptureIsDefault => CaptureBitrateMbps == 50 && KeyframeSeconds == .5;
+    public int KeyframeHalfSeconds => (int)Math.Round(KeyframeSeconds * 2);
+    // Appended to signatures and cache keys only when non-default.
+    public string CaptureKey => CaptureIsDefault ? "" : $"|capture:{CaptureBitrateMbps}mbps:gop{KeyframeHalfSeconds}";
+    public string ExportKey(string quality, bool audio = false) =>
+        (quality == "custom" ? $"|crf:{Crf}" : "") + (Preset != "fast" ? "|preset:" + Preset : "") + (Tune != "none" ? "|tune:" + Tune : "") + (audio && AudioBitrateKbps != 192 ? $"|aac:{AudioBitrateKbps}" : "");
+    public int CrfFor(string quality) => quality switch { "maximum" => 12, "high" => 16, "standard" => 20, "custom" => Crf, _ => throw new IOException("Unsupported quality.") };
+    public string[] X264Arguments(string quality)
+    {
+        var args = new List<string> { "-c:v", "libx264", "-preset", Preset, "-crf", CrfFor(quality).ToString(CultureInfo.InvariantCulture) };
+        if (Tune != "none") args.AddRange(new[] { "-tune", Tune });
+        // CRF 0 is lossless, which x264 encodes as High 4:4:4 Predictive (forcing -profile high would fail).
+        // Such files are huge and some players/editors reject them.
+        args.AddRange(CrfFor(quality) == 0 ? new[] { "-pix_fmt", "yuv420p" } : new[] { "-profile:v", "high", "-pix_fmt", "yuv420p" });
+        return args.ToArray();
+    }
+}
+
 internal sealed class BatchPlan
 {
     public string Schema { get; set; } = "mcc-batch/v1";
@@ -34,6 +81,7 @@ internal sealed class BatchPlan
     public string OutputFormat { get; set; } = "mp4";
     public int OutputResolution { get; set; } = 1440;
     public string OutputQuality { get; set; } = "high";
+    public ExportEncoding Encoding { get; set; } = new();
     public string MccRoot { get; set; } = "";
     public string OutputDirectory { get; set; } = "";
     public string? SettingsIni { get; set; }
@@ -94,6 +142,7 @@ internal sealed class BatchRecording : IDisposable
     {
         ValidateOutputFormat(plan.OutputFormat);
         ValidateVideoProfile(plan.OutputResolution,plan.OutputQuality);
+        plan.Encoding??=new();plan.Encoding.Validate();
         if(plan.CaptureKind=="highlights")throw new IOException("Multikill exports require a mcc-highlights/v1 job. Find and select highlights in the export desk first.");
         if(plan.Schema!="mcc-batch/v1"||!Guid.TryParseExact(plan.Id,"N",out _))throw new IOException("Unsupported batch job or invalid job ID.");
         if(plan.CaptureProfile!="offline-1440p60-v2")throw new IOException("This job uses an older capture profile. Start a New reel to render every film frame at 60 fps.");
@@ -122,7 +171,8 @@ internal sealed class BatchRecording : IDisposable
         if(plan.Items.Select(i=>i.Film).Distinct(StringComparer.OrdinalIgnoreCase).Any(film=>{var title=FilmTitle.Detect(film);return title==FilmTitle.Halo4||title==FilmTitle.Halo2A;}))signatureData+="|native-h4-h2a-hud-fonts-v1";
         if(plan.OutputFormat!="mp4")signatureData+="|container:"+plan.OutputFormat;
         if(plan.FrameRate!=60)signatureData+="|fps:"+plan.FrameRate;
-        if(plan.OutputResolution!=1440||plan.OutputQuality!="high")signatureData+=$"|video:{plan.OutputResolution}:{plan.OutputQuality}";
+        if(plan.OutputResolution!=1440||plan.OutputQuality!="high")signatureData+=$"|video:{plan.OutputResolution}:{plan.OutputQuality}"+plan.Encoding.ExportKey(plan.OutputQuality);
+        signatureData+=plan.Encoding.CaptureKey;
         var signature=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(signatureData)));
         if(plan.Signature.Length>0&&plan.Signature!=signature)throw new IOException("This job's sources, capture settings or renderer changed. Start a New reel to avoid reusing incompatible captures.");
         plan.Signature=signature;
@@ -209,7 +259,7 @@ internal sealed class BatchRecording : IDisposable
                     var info=new FileInfo(item.Film);
                     if(info.Length!=item.SourceBytes||info.LastWriteTimeUtc.ToString("O")!=item.SourceModified)throw new IOException("The source film changed after this job started.");
                     item.State="loading";item.File=file;Publish("capturing",$"Loading {index+1} of {Plan.Items.Count}: {item.Name}");
-                    using var job=new BackgroundRecording(executable,item.Film,Plan.MccRoot,session,Plan.SampleSeconds,file,Plan.SettingsSnapshot,Plan.Fov,frameRate:Plan.FrameRate);
+                    using var job=new BackgroundRecording(executable,item.Film,Plan.MccRoot,session,Plan.SampleSeconds,file,Plan.SettingsSnapshot,Plan.Fov,frameRate:Plan.FrameRate,encoding:Plan.Encoding);
                     active=job;
                     job.Changed+=status=>
                     {
@@ -228,7 +278,7 @@ internal sealed class BatchRecording : IDisposable
                     cancellation.Token.ThrowIfCancellationRequested();
                     if(!result.Complete)throw new IOException(result.Message);
                     Publish("finalizing",$"Preparing {Plan.OutputResolution}p export: {item.Name}");
-                    var profiled=await DeliverVideoProfile(file,Plan.OutputResolution,Plan.OutputQuality,clipFolder,cancellation.Token);
+                    var profiled=await DeliverVideoProfile(file,Plan.OutputResolution,Plan.OutputQuality,Plan.Encoding,clipFolder,cancellation.Token);
                     item.File=await DeliverContainer(profiled,Plan.OutputFormat,clipFolder,cancellation.Token);
                     if(item.File!=file)File.Delete(file);
                     if(profiled!=file&&profiled!=item.File)File.Delete(profiled);
@@ -334,11 +384,11 @@ internal sealed class BatchRecording : IDisposable
     }
     internal static void ValidateVideoProfile(int resolution,string quality)
     {
-        if(resolution is not (1080 or 1440 or 2160)||quality is not ("standard" or "high"))
-            throw new IOException("Choose 1080p, 1440p or 4K, and Standard or High quality.");
+        if(resolution is not (720 or 1080 or 1440 or 2160)||quality is not ("standard" or "high" or "maximum" or "custom"))
+            throw new IOException("Choose 720p, 1080p, 1440p or 4K, and Standard, High, Maximum or Custom quality.");
     }
-    internal static int VideoWidth(int resolution)=>resolution switch {1080=>1920,1440=>2560,2160=>3840,_=>throw new IOException("Unsupported export resolution.")};
-    internal static async Task<string> DeliverVideoProfile(string source,int resolution,string quality,string folder,CancellationToken token)
+    internal static int VideoWidth(int resolution)=>resolution switch {720=>1280,1080=>1920,1440=>2560,2160=>3840,_=>throw new IOException("Unsupported export resolution.")};
+    internal static async Task<string> DeliverVideoProfile(string source,int resolution,string quality,ExportEncoding encoding,string folder,CancellationToken token)
     {
         ValidateVideoProfile(resolution,quality);
         if(resolution==1440&&quality=="high")return source;
@@ -347,7 +397,8 @@ internal sealed class BatchRecording : IDisposable
         var output=Path.Combine(folder,Path.GetFileNameWithoutExtension(source)+$"-{resolution}p.mp4");
         try
         {
-            await Execute(FindTool("ffmpeg")??throw new IOException("ffmpeg.exe is missing."),new[]{"-v","error","-nostdin","-n","-copyts","-i",source,"-map","0:v:0","-map","0:a:0","-map_metadata","0","-map_chapters","0","-vf",$"scale={VideoWidth(resolution)}:{resolution}:flags=lanczos,setsar=1","-c:v","libx264","-preset","fast","-crf",quality=="high"?"16":"20","-profile:v","high","-pix_fmt","yuv420p","-video_track_timescale","15360","-c:a","copy","-avoid_negative_ts","disabled","-movie_timescale","48000","-movflags","+faststart",temporary},token);
+            await Execute(FindTool("ffmpeg")??throw new IOException("ffmpeg.exe is missing."),new[]{"-v","error","-nostdin","-n","-copyts","-i",source,"-map","0:v:0","-map","0:a:0","-map_metadata","0","-map_chapters","0","-vf",$"scale={VideoWidth(resolution)}:{resolution}:flags=lanczos,setsar=1"}
+                .Concat(encoding.X264Arguments(quality)).Concat(new[]{"-video_track_timescale","15360","-c:a","copy","-avoid_negative_ts","disabled","-movie_timescale","48000","-movflags","+faststart",temporary}).ToArray(),token);
             var before=await Probe(source,token);var after=await Probe(temporary,token);
             if(before.Frames!=after.Frames||before.Chapters!=after.Chapters||Math.Abs(before.Seconds-after.Seconds)>.05||Math.Abs(before.VideoStart-after.VideoStart)>1.0/48000||Math.Abs(before.AudioStart-after.AudioStart)>1.0/48000||Math.Abs(before.AudioSeconds-after.AudioSeconds)>1.0/48000)
                 throw new IOException("Export resizing did not preserve frames, audio timing or chapters. Original capture is kept.");

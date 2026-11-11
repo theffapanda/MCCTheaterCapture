@@ -22,6 +22,10 @@ void ConfigureNativeVideoOnlyRecording(bool enabled);
 void ConfigureNativeFrameOrigin(int firstTick);
 // Video-only offline export: 60 (default) or 120 frames per second.
 void ConfigureNativeExportFrameRate(unsigned fps);
+// H.264 target bitrate in Mbps at 60 fps (doubles at 120 fps); default 50.
+void ConfigureNativeVideoBitrate(unsigned mbps);
+// Keyframe interval in half-second steps (1 = 0.5 s, the default; 2 = 1 s; 4 = 2 s).
+void ConfigureNativeKeyframeInterval(unsigned halfSeconds);
 // Call after native scene rendering, on the immediate-context/render thread.
 // Pause time is excluded. Live recording uses asynchronous readbacks. Offline
 // export waits when its bounded GPU or encoder queue fills; every rendered image is retained.

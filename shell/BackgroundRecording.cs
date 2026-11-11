@@ -55,15 +55,17 @@ internal sealed class BackgroundRecording : IDisposable
     public bool IsRunning=>!completion.Task.IsCompleted&&!status.Finished;
     public BackgroundRecordingStatus Status {get {lock(commandGate)return status;}}
 
-    public BackgroundRecording(string executable,string film,string mccRoot,string sessionDirectory,double? recordSeconds=null,string? outputFile=null,string? settingsIni=null,int fov=91,int startTick=0,int frameRate=60)
+    private readonly ExportEncoding encoding;
+    public BackgroundRecording(string executable,string film,string mccRoot,string sessionDirectory,double? recordSeconds=null,string? outputFile=null,string? settingsIni=null,int fov=91,int startTick=0,int frameRate=60,ExportEncoding? encoding=null)
     {
         this.executable=executable;this.film=film;this.mccRoot=mccRoot;this.sessionDirectory=sessionDirectory;
         this.recordSeconds=recordSeconds;this.settingsIni=settingsIni;this.fov=fov;this.startTick=startTick;this.frameRate=frameRate;
+        this.encoding=encoding??new();this.encoding.Validate();
         var title=FilmTitle.Detect(film);
         isolatedAudioPass=title==FilmTitle.Halo4||title==FilmTitle.Halo2A;
         if(startTick<0||startTick>0&&(!recordSeconds.HasValue||recordSeconds<=0))throw new IOException("Ranged captures need a valid start tick and duration.");
         if(frameRate is not (60 or 120))throw new IOException("Choose 60 or 120 fps.");
-        if(frameRate==120&&(title!=FilmTitle.Halo3||startTick>0))throw new IOException("120 fps export is available for whole Halo 3 films only.");
+        if(frameRate==120&&title!=FilmTitle.Halo3)throw new IOException("120 fps export is available for Halo 3 films only.");
         Directory.CreateDirectory(sessionDirectory);
         var selected=outputFile==null?ReserveOutput(film):ReserveExactOutput(outputFile);reservation=selected.Reservation;
         status=new("preparing",selected.File,"Preparing audio and video…");
@@ -184,7 +186,8 @@ internal sealed class BackgroundRecording : IDisposable
         var info=new ProcessStartInfo(executable){UseShellExecute=false,CreateNoWindow=true,WorkingDirectory=Path.GetDirectoryName(executable)!,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,StandardOutputEncoding=Encoding.UTF8};
         void Arg(string name,string value){info.ArgumentList.Add(name);info.ArgumentList.Add(value);}
         Arg("--background","true");Arg("--film",film);Arg("--title",FilmTitle.Detect(film).EngineFolder);Arg("--mcc-root",mccRoot);Arg("--output",directory);Arg("--record-output",pass.File);
-        Arg(pass.Audio?"--audio-only":"--video-only","true");if(!pass.Audio&&frameRate!=60)Arg("--frame-rate",frameRate.ToString(System.Globalization.CultureInfo.InvariantCulture));Arg("--fov",fov.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Arg(pass.Audio?"--audio-only":"--video-only","true");if(!pass.Audio&&frameRate!=60)Arg("--frame-rate",frameRate.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if(!pass.Audio&&!encoding.CaptureIsDefault){Arg("--video-bitrate",encoding.CaptureBitrateMbps.ToString(System.Globalization.CultureInfo.InvariantCulture));Arg("--keyframe-half-seconds",encoding.KeyframeHalfSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));}Arg("--fov",fov.ToString(System.Globalization.CultureInfo.InvariantCulture));
         if(settingsIni!=null)Arg("--settings-ini",settingsIni);
         if(recordSeconds is >0)Arg("--record-seconds",recordSeconds.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
         if(startTick>0)Arg("--record-start-tick",startTick.ToString(System.Globalization.CultureInfo.InvariantCulture));
@@ -404,7 +407,12 @@ internal static class BackgroundRecordingCli
             {
                 try{savedFov=JsonSerializer.Deserialize<Preferences>(File.ReadAllText(preferencesPath),new JsonSerializerOptions{PropertyNameCaseInsensitive=true})?.FovDegrees??91;}catch(JsonException){}
             }
-            using var job=new BackgroundRecording(nativeHost,film,mccRoot,session,seconds,Argument(args,"--record-output"),Program.SettingsIniPath(args),Program.FovDegrees(args,savedFov),frameRate:int.TryParse(Argument(args,"--frame-rate"),out var fps)?fps:60);
+            int startTick=0;
+            if(Argument(args,"--record-start-tick") is string start&&(!int.TryParse(start,System.Globalization.NumberStyles.None,System.Globalization.CultureInfo.InvariantCulture,out startTick)||startTick<0))
+                throw new IOException("--record-start-tick must be a non-negative film tick.");
+            using var job=new BackgroundRecording(nativeHost,film,mccRoot,session,seconds,Argument(args,"--record-output"),Program.SettingsIniPath(args),Program.FovDegrees(args,savedFov),startTick,frameRate:int.TryParse(Argument(args,"--frame-rate"),out var fps)?fps:60,
+                encoding:new ExportEncoding{CaptureBitrateMbps=int.TryParse(Argument(args,"--video-bitrate"),out var mbps)?mbps:50,
+                    KeyframeSeconds=double.TryParse(Argument(args,"--keyframe-seconds"),System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,out var gop)?gop:.5});
             job.Changed+=value=>{lock(gate)events.Add(new{type="background-recording",elapsedSeconds=clock.Elapsed.TotalSeconds,utc=DateTimeOffset.UtcNow,detail=value});};
             job.Start();
             if(double.TryParse(Argument(args,"--auto-close-seconds"),System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,out var watchdog)&&watchdog>0&&await Task.WhenAny(job.Completion,Task.Delay(TimeSpan.FromSeconds(watchdog)))!=job.Completion)await job.CancelAsync();

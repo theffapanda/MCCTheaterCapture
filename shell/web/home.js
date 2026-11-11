@@ -6,6 +6,7 @@
   let highlights = {}, highlightSelection = new Set(), highlightResultKey = '';
   let highlightDiagnosticsKey = '', highlightDiagnosticsRendered = false;
   let formatClipId = '';
+  let monitoring = {}, monitorSaving = false, monitorFilmsKey = '';
   const highlightMode = () => $('capture-length').value === 'highlights';
   const pending = new Map();
   function native(type, data = {}, files) {
@@ -19,6 +20,7 @@
     });
   }
   bridge?.addEventListener('message', ({data}) => {
+    if (data.type === 'monitor-status') {receiveMonitoring(data.data);if(draft){renderSummary();renderLibrary();renderSequence();}return;}
     if (data.type === 'highlights-status') {receiveHighlights(data.data);renderSummary();renderLibrary();renderSequence();return;}
     if (data.type === 'batch-status') {batch = data.data; renderJob(); renderSummary(); return;}
     if (data.type === 'background-recording') {showBackground(data.job); renderSummary(); return;}
@@ -30,7 +32,7 @@
   const mapTitle = film => films.find(f => f.path?.toLowerCase() === (film?.path || film?.film || '').toLowerCase())?.title || film?.title || 'halo3';
   const displayMap = (name, film) => window.MccMapNames?.display(name, mapTitle(film)) || window.Halo3MapNames?.display(name) || name;
   const plural = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`;
-  const locked = () => !draft || busy || !!batch.running || !!highlights.running || !!highlights.scanning;
+  const locked = () => !draft || busy || !!batch.running || !!highlights.running || !!highlights.scanning || !!monitoring.running;
   // A checkpoint describes an immutable export attempt, not an editor lock.
   // The first edit forks its sources/settings into a fresh draft; Retry keeps
   // targeting the original job and its verified completed clips.
@@ -77,6 +79,9 @@
     $('hero-open').disabled = !known?.canDecode || !!batch.running || busy || !!(singleJob && !singleJob.finished);
     $('hero-open').innerHTML = '<span aria-hidden="true">▶</span>';
     $('hero-open').append(document.createTextNode($('background-recording').checked ? ' Export single film' : ' Open playback'));
+    // With "Export directly to file" on, the main button exports; keep a way to preview playback.
+    $('hero-preview').hidden = !$('background-recording').checked;
+    $('hero-preview').disabled = $('hero-open').disabled;
     $('hero-add').disabled = locked() || !known?.canDecode || queued;
     $('hero-add').textContent = queued ? '✓ In sequence' : '+ Add to sequence';
     $('asset-status').textContent = Object.keys(artwork).length ? 'MCC ARTWORK · LOCAL GAME FILES' : 'LOCAL WORKSPACE · MAP ART UNAVAILABLE';
@@ -100,8 +105,20 @@
     return `${percent} · Current film: ${eta(job.estimatedSecondsRemaining)} remaining + finalization`;
   }
   function fresh(previous) {
-    return {schema:'mcc-batch/v1', id:crypto.randomUUID().replaceAll('-', ''), name:previous?.name || 'Theater reel', mode:previous?.mode || 'separate', outputFormat:previous?.outputFormat || 'mp4', outputResolution:previous?.outputResolution || 1440, outputQuality:previous?.outputQuality || 'high', frameRate:previous?.frameRate || 60, fov:previous?.fov || batch.fov || 91, captureKind:previous?.captureKind || 'full', highlightOptions:previous?.highlightOptions || {minimumKills:4,exact:false,selection:'all',beforeSeconds:3,afterSeconds:3}, highlightFormat:structuredClone(previous?.highlightFormat || {layout:'original',blur:22,dim:40,gameplayPosition:48}),highlightCaptions:structuredClone(previous?.highlightCaptions || {}),sampleSeconds:previous?.sampleSeconds || null, continueOnError:previous?.continueOnError ?? true, items:[], signature:'', state:'draft'};
+    return {schema:'mcc-batch/v1', id:crypto.randomUUID().replaceAll('-', ''), name:previous?.name || 'Theater reel', mode:previous?.mode || 'separate', outputFormat:previous?.outputFormat || 'mp4', outputResolution:previous?.outputResolution || 1440, outputQuality:previous?.outputQuality || 'high', encoding:{...defaultEncoding(), ...(previous?.encoding || {})}, frameRate:previous?.frameRate || 60, fov:previous?.fov || batch.fov || 91, captureKind:previous?.captureKind || 'full', highlightOptions:previous?.highlightOptions || {minimumKills:4,exact:false,selection:'all',beforeSeconds:3,afterSeconds:3}, highlightFormat:structuredClone(previous?.highlightFormat || {layout:'original',blur:22,dim:40,gameplayPosition:48}),highlightCaptions:structuredClone(previous?.highlightCaptions || {}),sampleSeconds:previous?.sampleSeconds || null, continueOnError:previous?.continueOnError ?? true, items:[], signature:'', state:'draft'};
   }
+  // Defaults match the original fixed profile (50 Mbps capture, 0.5 s keyframes, x264 fast, 192 kbps clip audio).
+  function defaultEncoding() { return {captureBitrateMbps:50, keyframeSeconds:0.5, crf:18, preset:'fast', tune:'none', audioBitrateKbps:192}; }
+  function readEncoding() {
+    return {captureBitrateMbps:Number($('capture-bitrate').value), keyframeSeconds:Number($('capture-keyframe').value), crf:Number($('output-crf').value),
+      preset:$('output-preset').value, tune:$('output-tune').value, audioBitrateKbps:Number($('audio-bitrate').value)};
+  }
+  function applyEncoding(encoding) {
+    const e = {...defaultEncoding(), ...(encoding || {})};
+    $('capture-bitrate').value = String(e.captureBitrateMbps); $('capture-keyframe').value = String(e.keyframeSeconds); $('output-crf').value = e.crf;
+    $('output-preset').value = e.preset; $('output-tune').value = e.tune; $('audio-bitrate').value = String(e.audioBitrateKbps);
+  }
+  function crfFor(quality, encoding) { return {maximum:12, high:16, standard:20}[quality] ?? encoding?.crf ?? 18; }
   function readControls() {
     if (!draft || locked()) return;
     editableDraft();
@@ -109,6 +126,7 @@
     draft.outputFormat = $('output-format').value;
     draft.outputResolution = Number($('output-resolution').value);
     draft.outputQuality = $('output-quality').value;
+    draft.encoding = readEncoding();
     draft.frameRate = Number($('output-fps').value);
     draft.mode = document.querySelector('input[name=mode]:checked').value;
     draft.fov = Number($('batch-fov').value);
@@ -122,6 +140,7 @@
     $('output-format').value = draft.outputFormat || 'mp4';
     $('output-resolution').value = draft.outputResolution || 1440;
     $('output-quality').value = draft.outputQuality || 'high';
+    applyEncoding(draft.encoding);
     $('output-fps').value = draft.frameRate || 60;
     $('reel-name').value = draft.name; $('batch-fov').value = draft.fov;
     $('capture-length').value = draft.captureKind === 'highlights' ? 'highlights' : draft.sampleSeconds != null ? 'sample' : 'full';
@@ -163,7 +182,7 @@
       const meta = el('div', null, 'film-meta'); if(film.titleName) meta.append(el('span',film.titleName)); meta.append(el('span', film.duration || duration(film.totalTicks / 60)));
       const open = el('button', 'Open', 'text-button'); open.title = film.name; open.disabled = !!batch.running;
       open.disabled ||= !film.canDecode || busy || !!(singleJob && !singleJob.finished);
-      open.onclick = () => {closeLibrary();native('open-film', {filmId:film.id}).catch(error);}; meta.append(open); info.append(meta);
+      open.onclick = () => {closeLibrary();native('open-film', {filmId:film.id, preview:true}).catch(error);}; meta.append(open); info.append(meta);
       if (!film.canDecode) info.append(el('div', film.reason, 'film-reason'));
       row.append(info);
       const add = el('button', selected ? '✓' : '+', `film-add${selected ? ' added' : ''}`); add.disabled = locked() || selected || !film.canDecode;
@@ -177,7 +196,6 @@
     draft.items.forEach((item, index) => {
       const film = films.find(f => f.path.toLowerCase() === item.film.toLowerCase());
       const row = el('div', null, `sequence-row${item.film.toLowerCase() === selectedPath.toLowerCase() ? ' selected' : ''}`);row.setAttribute('role', 'listitem');row.dataset.path = item.film;row.dataset.index = index;row.draggable = !locked();image(item.map, row, film || item);
-      row.append(el('span', String(index + 1).padStart(2, '0'), 'sequence-number'));
       const preview = el('button', null, 'sequence-preview');preview.title = `Preview ${item.name}`;preview.setAttribute('aria-label', `Select ${displayMap(item.map, item)}, ${item.name}`);preview.setAttribute('aria-pressed',String(row.classList.contains('selected')));preview.onclick = () => selectFilm(item);row.append(preview);
       const info = el('div', null, 'sequence-info');info.append(el('strong', displayMap(item.map, item)), el('small', film?.gameVariantName || film?.gameType || item.name), el('small', duration(Math.min(item.totalTicks / 60, draft.sampleSeconds ?? Infinity))));row.append(info);
       const controls = el('div', null, 'sequence-controls');
@@ -207,10 +225,10 @@
     if (!draft) return;
     const fileType = (draft.outputFormat || 'mp4').toUpperCase();
     const n = draft.items.length, seconds = draft.items.reduce((sum, i) => sum + Math.min(i.totalTicks / 60, draft.sampleSeconds ?? Infinity), 0), isLocked = locked();
-    $('nav-count').textContent = String(n).padStart(2, '0');
     $('export-indicator').hidden = !batch.running && !(singleJob && !singleJob.finished);
     $('no-jobs').hidden = !!batch.job || !!draft.signature || !!singleJob;
     $('sample-field').hidden = $('capture-length').value !== 'sample';
+    $('highlights-panel').hidden = !highlightMode();
     $('sequence-duration').textContent = duration(seconds);
     $('sequence-size').textContent = `${plural(n, 'film')} · ${draft.sampleSeconds == null ? 'Full original films' : `First ${draft.sampleSeconds}s of each film`}`;
     const cleanName = (draft.name || 'Theater reel').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().replace(/\.+$/, '').slice(0, 72) || 'Theater reel';
@@ -220,29 +238,37 @@
     $('delivery-description').textContent = `${draft.outputResolution || 1440}p${draft.frameRate || 60} · ${draft.outputQuality || 'high'} quality · FOV ${draft.fov}° · Game audio`;
     // Delivery plus the active video intermediate, cached audio and its temporary capture.
     const longest = Math.max(0, ...draft.items.map(i => Math.min(i.totalTicks / 60, draft.sampleSeconds ?? Infinity)));
-    const videoRate = 50000000 * (draft.frameRate || 60) / 60;
+    const encoding = {...defaultEncoding(), ...(draft.encoding || {})};
+    const videoRate = encoding.captureBitrateMbps * 1e6 * (draft.frameRate || 60) / 60;
     const gigabytes = ((draft.mode === 'separate' ? seconds : seconds * 2) * (videoRate + 192000) + longest * videoRate + (seconds + longest) * 192000) / 8 / 1e9;
-    $('estimate').textContent = (draft.outputResolution || 1440) !== 1440 || (draft.outputQuality || 'high') !== 'high' ? 'File size varies with quality and scene detail.' : n ? `Approx. ${gigabytes < 1 ? `${Math.ceil(gigabytes * 1000)} MB` : `${gigabytes.toFixed(1)} GB`} disk space needed.` : '';
+    $('estimate').textContent = (draft.outputResolution || 1440) !== 1440 || (draft.outputQuality || 'high') !== 'high' ? 'Re-encoded file size varies with quality and scene detail.' : n ? `Approx. ${gigabytes < 1 ? `${Math.ceil(gigabytes * 1000)} MB` : `${gigabytes.toFixed(1)} GB`} disk space needed.` : '';
     $('order-note').textContent = draft.mode === 'separate' ? 'Films export in this order. Numbered filenames keep your sequence intact.' : 'This sequence becomes the chapter order in your reel.';
     $('delivery-visual').replaceChildren();
     if (draft.mode !== 'combined') for (let i = 0; i < Math.min(n, 7); i++) $('delivery-visual').append(el('i', null, 'delivery-chip'));
     if (draft.mode === 'both' && n) $('delivery-visual').append(el('span', '+', 'delivery-plus'));
     if (draft.mode !== 'separate' && n) {const joined = el('span', null, 'delivery-chip joined'); for (let i = 0; i < Math.min(n, 12); i++) joined.append(el('i'));$('delivery-visual').append(joined);}
-    let issue = !n ? 'Add at least one film to start.' : !Number.isInteger(draft.fov) || draft.fov < 55 || draft.fov > 120 ? 'Choose a FOV from 55 to 120.' : draft.sampleSeconds != null && (!Number.isFinite(draft.sampleSeconds) || draft.sampleSeconds <= 0 || draft.sampleSeconds > 43200) ? 'Choose a positive sample length up to 43200 seconds.' : !batch.toolsReady ? 'Bundled export tools are missing. Extract the complete application package again.' : singleJob && !singleJob.finished ? 'A single-film recording is active.' : (draft.frameRate || 60) === 120 && !highlightMode() && draft.items.some(i => (i.title || 'halo3') !== 'halo3') ? '120 fps works with Halo 3 films only. Remove the other films or choose 60 fps.' : '';
+    let issue = !n ? 'Add at least one film to start.' : !Number.isInteger(draft.fov) || draft.fov < 55 || draft.fov > 120 ? 'Choose a FOV from 55 to 120.' : draft.sampleSeconds != null && (!Number.isFinite(draft.sampleSeconds) || draft.sampleSeconds <= 0 || draft.sampleSeconds > 43200) ? 'Choose a positive sample length up to 43200 seconds.' : draft.outputQuality === 'custom' && (!Number.isInteger(encoding.crf) || encoding.crf < 0 || encoding.crf > 51) ? 'Choose a custom CRF from 0 to 51.' : !batch.toolsReady ? 'Bundled export tools are missing. Extract the complete application package again.' : singleJob && !singleJob.finished ? 'A single-film recording is active.' : (draft.frameRate || 60) === 120 && !highlightMode() && draft.items.some(i => (i.title || 'halo3') !== 'halo3') ? '120 fps works with Halo 3 films only. Remove the other films or choose 60 fps.' : '';
     if (batch.running) issue = 'Export in progress.';
     const complete = draft.state === 'completed' && !!draft.signature;
     $('preflight').textContent = issue || (complete ? 'This job is complete. Start a new reel to export again.' : draft.signature ? 'Ready to resume.' : `${plural(n, 'film')} ready`);
     $('preflight').classList.toggle('ready', !issue);
     $('start-batch').disabled = !!issue || !!batch.running || busy || complete;
     $('start-batch').textContent = batch.running ? 'Export running…' : draft.signature ? 'Resume export' : `Start export${n ? ` · ${plural(n, 'film')}` : ''}`;
-    for (const id of ['output-resolution','output-quality','output-fps','output-format','reel-name','batch-fov','capture-length','sample-seconds','continue-errors','output-folder','pick-batch','empty-add','add-all']) $(id).disabled = isLocked;
+    for (const id of ['output-resolution','output-quality','output-fps','output-format','output-crf','output-preset','output-tune','capture-bitrate','capture-keyframe','audio-bitrate','reel-name','batch-fov','capture-length','sample-seconds','continue-errors','output-folder','pick-batch','empty-add','add-all']) $(id).disabled = isLocked;
     for (const radio of document.querySelectorAll('input[name=mode]')) radio.disabled = isLocked;
     $('new-job').disabled = isLocked;
     renderHighlights();
     const resolution = draft.outputResolution || 1440, quality = draft.outputQuality || 'high';
     $('capture-resolution').textContent=resolution === 2160 ? `4K${draft.frameRate || 60} (upscaled)` : `${resolution}p${draft.frameRate || 60}`;
     $('output-fps').parentElement.hidden=false;
-    $('capture-quality').textContent=quality === 'high' ? 'High quality' : 'Standard quality';
+    const passthrough = resolution === 1440 && quality === 'high';
+    const qualityText = () => passthrough && !highlightMode() ? `Original capture · ${encoding.captureBitrateMbps * (draft.frameRate || 60) / 60} Mbps` : `CRF ${crfFor(quality, encoding)} · x264 ${encoding.preset}${encoding.tune !== 'none' ? ' · ' + encoding.tune : ''}`;
+    $('capture-quality').textContent=qualityText();
+    $('crf-field').hidden = quality !== 'custom';
+    $('audio-bitrate-field').hidden = !highlightMode();
+    $('encoder-note').textContent = `Capture: H.264 at ${encoding.captureBitrateMbps} Mbps (doubles at 120 fps), keyframe every ${encoding.keyframeSeconds} s. ` +
+      (highlightMode() ? `Clips are always re-encoded with x264 and ${encoding.audioBitrateKbps} kbps AAC audio.` : passthrough ? 'At 1440p + High the capture is delivered as-is, so speed and tune are not used.' : 'Speed and tune apply to the x264 re-encode; slower presets make smaller files at the same quality.') +
+      (quality === 'custom' && encoding.crf === 0 ? ' CRF 0 is lossless: very large files that some players cannot open.' : '');
     $('output-resolution').title='';
     $('output-resolution').parentElement.hidden=false;
     if (highlights.running || highlights.scanning) {$('start-batch').disabled = true;$('hero-open').disabled = true;$('pick').disabled = true;}
@@ -259,7 +285,7 @@
       $('delivery-description').textContent = `${highlightFormatOptions().layout==='soft-focus'?'1080×1920 · Soft focus · 60 fps':`${resolution}p60`} · ${quality} quality · FOV ${draft.fov} · Game audio`;
       const portrait = highlightFormatOptions().layout === 'soft-focus';
       $('capture-resolution').textContent=portrait?'1080×1920 · 60 fps':resolution === 2160 ? '4K60 (upscaled)' : `${resolution}p60`;
-      $('capture-quality').textContent=quality === 'high' ? 'High quality' : 'Standard quality';
+      $('capture-quality').textContent=qualityText();
       $('output-resolution').disabled=isLocked || portrait;
       $('output-resolution').parentElement.hidden=portrait;
       $('output-fps').parentElement.hidden=true; // highlight clips are always 60 fps
@@ -326,7 +352,7 @@
   };
 
   async function refresh() {
-    const catalog = await native('catalog'); films = catalog.films; batch = catalog.batch;artwork = catalog.artwork || {};receiveHighlights(catalog.highlights || {});
+    const catalog = await native('catalog'); films = catalog.films; batch = catalog.batch;artwork = catalog.artwork || {};receiveHighlights(catalog.highlights || {});receiveMonitoring(catalog.monitoring || {});
     $('background-recording').checked = !!catalog.backgroundRecording;showBackground(catalog.job);applyDraft(batch.draft);
     if (!catalog.maps) $('status').textContent = 'Choose the MCC halo3/maps folder to enable export.';
   }
@@ -370,7 +396,7 @@
   $('search').oninput = renderLibrary;
   $('pick-batch').onclick = pickFilms; $('empty-add').onclick = pickFilms; $('add-all').onclick = () => addFilms(visibleFilms());
   $('reel-name').oninput = changed;
-  for (const id of ['output-resolution','output-quality','output-fps','output-format','batch-fov','capture-length','sample-seconds','continue-errors']) $(id).onchange = () => {changed();renderSequence();if(id === 'capture-length' && highlightMode()) $('highlights-panel').scrollIntoView({block:'start'});};
+  for (const id of ['output-resolution','output-quality','output-fps','output-format','output-crf','output-preset','output-tune','capture-bitrate','capture-keyframe','audio-bitrate','batch-fov','capture-length','sample-seconds','continue-errors']) $(id).onchange = () => {changed();renderSequence();if(id === 'capture-length' && highlightMode()) $('highlights-panel').scrollIntoView({block:'start'});};
   for (const radio of document.querySelectorAll('input[name=mode]')) radio.onchange = changed;
   $('output-folder').onclick = () => native('batch-output-folder').then(state => {
     batch = state;
@@ -396,8 +422,11 @@
   for (const id of ['browse-library','hero-browse','sequence-add','footer-library']) $(id).onclick = openLibrary;
   $('close-library').onclick = closeLibrary;
   $('library-dialog').addEventListener('click', event => {if (event.target === $('library-dialog')) {const rect=event.target.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)closeLibrary();}});
-  for (const [id, target] of [['show-sequence','sequence-section'],['show-exports','exports-section']]) $(id).onclick = () => {document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.id===id));$(target).scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'start'});};
+  function showWorkspacePage(auto) {const wasAuto=!$('auto-highlights-view').hidden;$('auto-highlights-view').hidden=!auto;document.querySelector('main').hidden=auto;return wasAuto;}
+  $('show-auto-highlights').onclick = () => {document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.id==='show-auto-highlights'));showWorkspacePage(true);window.scrollTo({top:0,behavior:'instant'});};
+  for (const [id, target] of [['show-sequence','sequence-section']]) $(id).onclick = () => {document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.id===id));const wasAuto=showWorkspacePage(false);$(target).scrollIntoView({behavior:wasAuto||matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'start'});};
   $('hero-open').onclick = () => {const film=films.find(f=>f.path.toLowerCase()===selectedPath.toLowerCase());if(film)native('open-film',{filmId:film.id}).catch(error);};
+  $('hero-preview').onclick = () => {const film=films.find(f=>f.path.toLowerCase()===selectedPath.toLowerCase());if(film)native('open-film',{filmId:film.id,preview:true}).catch(error);};
   $('hero-add').onclick = () => {const film=films.find(f=>f.path.toLowerCase()===selectedPath.toLowerCase());if(film)addFilms([film]);};
 
   function highlightOptions() {
@@ -417,6 +446,7 @@
     highlights = value || {};
     const key = JSON.stringify((highlights.scan?.clips || []).map(c=>[c.id,c.startTick,c.endTick]));
     if (key !== highlightResultKey) {highlightResultKey=key;highlightSelection=new Set((highlights.scan?.clips || []).map(c=>c.id));}
+    renderSavedHighlights();
   }
   function highlightTime(ticks) {return (ticks/60).toFixed(2)+'s';}
   function populateHighlightDiagnostics() {
@@ -458,7 +488,6 @@
     if ($('highlights-scan-details').open) populateHighlightDiagnostics();
   }
   function renderHighlights() {
-    $('highlights-panel').hidden = !highlightMode();
     const active = !!highlights.scanning || !!highlights.running, disabled = active || busy || !!batch.running;
     renderHighlightFormat(disabled);
     for (const id of ['highlight-minimum','highlight-exact','highlight-scope','highlight-before','highlight-after']) $(id).disabled = disabled;
@@ -535,7 +564,7 @@
     $('highlight-format').value=f.layout;$('highlight-blur').value=f.blur;$('highlight-dim').value=f.dim;$('highlight-position').value=f.gameplayPosition;
   }
   function highlightCompositionRequest() {
-    return {outputResolution:Number($('output-resolution').value),outputQuality:$('output-quality').value,outputFormat:$('output-format').value,format:highlightFormatOptions(),captions:draft.highlightCaptions || {}};
+    return {outputResolution:Number($('output-resolution').value),outputQuality:$('output-quality').value,encoding:readEncoding(),outputFormat:$('output-format').value,format:highlightFormatOptions(),captions:draft.highlightCaptions || {}};
   }
   function selectCaptionClip(id) {
     formatClipId=id;$('highlight-caption-clip').value=id;
@@ -582,6 +611,155 @@
     if(locked() || !formatClipId)return;editableDraft();draft.highlightCaptions ||= {};
     draft.highlightCaptions[formatClipId]={above:$('highlight-text-above').value,below:$('highlight-text-below').value};changed();
   };
+
+
+  function receiveMonitoring(state) {
+    monitoring = state;
+    if (!monitorSaving) {
+      $('monitor-enabled').checked = !!state.settings?.enabled;
+      $('monitor-auto').checked = !!state.settings?.autoExport;
+      $('monitor-minimum').value = String(state.settings?.minimumKills || 2);
+      $('monitor-fps').value = String(state.settings?.frameRate === 120 ? 120 : 60);
+      $('monitor-resolution').value = String(state.settings?.outputResolution || 1080);
+      $('monitor-quality').value = state.settings?.outputQuality || 'high';
+    }
+    $('monitor-resolution').disabled = monitorSaving;
+    $('monitor-quality').disabled = monitorSaving;
+    $('monitor-auto').disabled = monitorSaving || !$('monitor-enabled').checked;
+    $('monitor-enabled').disabled = monitorSaving;
+    $('monitor-minimum').disabled = monitorSaving;
+    $('monitor-fps').disabled = monitorSaving;
+    $('monitor-status').textContent = state.message || 'Monitoring is off.';
+    $('monitor-export-status').textContent = state.exportMessage || '';
+    $('monitor-cancel').hidden = !state.running;
+    $('monitor-output').textContent = 'Save to: ' + (state.outputDirectory || 'your export folder');
+    maybeReloadClipFiles(state);
+    const filmsKey=JSON.stringify([state.settings?.enabled,state.films]);
+    renderSavedHighlights();
+    if(filmsKey===monitorFilmsKey)return;
+    monitorFilmsKey=filmsKey;
+    $('monitor-films').replaceChildren();
+    if (!state.films?.length) $('monitor-films').append(el('p','Completed films will appear here.','fine'));
+    for (const film of state.films || []) {
+      const row=el('div',null,'monitor-film'),text=el('div');
+      text.append(el('strong',(film.titleName?film.titleName+' · ':'')+film.name),el('p',film.message,'fine'));
+      if(film.clips?.length) text.append(el('p',film.clips.map(c=>c.medal+' · '+highlightTime(c.startTick)).join(' / '),'fine'));
+      if(film.warnings?.length) text.append(el('p',film.warnings.join(' '),'fine'));
+      row.append(text);const actions=el('div',null,'monitor-actions');
+      const action=(label,type)=>{const button=el('button',label);button.onclick=()=>native(type,{hash:film.hash}).then(receiveMonitoring).catch(error);actions.append(button);return button;};
+      if(['ready','paused','export-failed'].includes(film.state)) action(film.exportRequested?'Queued':'Export clips','monitor-export').disabled=!state.settings?.enabled||film.exportRequested;
+      if(film.state==='scan-failed')action('Retry scan','monitor-retry-scan');
+      if(film.outputDirectory)action('Open folder','monitor-folder');
+      if(!['exporting','exported','dismissed'].includes(film.state))action('Dismiss','monitor-dismiss');
+      row.append(actions);$('monitor-films').append(row);
+    }
+  }
+  function renderSavedHighlights() {
+    const clips=[];
+    for(const film of monitoring?.films||[]) for(const clip of film.clips||[]) if(clip.state==='completed'&&clip.file) clips.push({...clip,source:film.name,hash:film.hash,kind:'monitor'});
+    for(const clip of highlights.job?.clips||[]) if(clip.state==='completed'&&clip.file) clips.push({...clip,source:clip.recorder||'Recent scan',kind:'manual'});
+    const unique=[...new Map(clips.map(clip=>[clip.file.toLowerCase(),clip])).values()];
+    const grid=$('saved-highlights');grid.replaceChildren();
+    if(!unique.length){grid.append(el('p','Saved clips will appear here after a multikill export.','saved-highlights-empty'));return;}
+    for(const clip of unique){
+      const card=el('article',null,'saved-highlight-card'),thumb=el('div',null,'saved-highlight-thumb'),url=art(clip.map,clip);
+      if(url)thumb.style.backgroundImage=`url("${url}")`;
+      thumb.append(el('span',clip.medal,'saved-highlight-medal'));
+      const body=el('div',null,'saved-highlight-info');body.append(el('strong',displayMap(clip.map,clip)+' · '+clip.medal),el('p',clip.source,'fine'));
+      if(clip.durationSeconds)body.append(el('small',clip.durationSeconds.toFixed(1)+' sec clip'));
+      const open=el('button','Open clip');open.onclick=()=>clip.kind==='monitor'?native('monitor-open-clip',{hash:clip.hash,clipId:clip.id}).catch(error):native('highlights-open-clip',{clipId:clip.id}).catch(error);
+      body.append(open);card.append(thumb,body);grid.append(card);
+    }
+  }
+  async function saveMonitoring() {
+    const settings={enabled:$('monitor-enabled').checked,autoExport:$('monitor-auto').checked,minimumKills:Number($('monitor-minimum').value),frameRate:Number($('monitor-fps').value),outputResolution:Number($('monitor-resolution').value),outputQuality:$('monitor-quality').value};
+    monitorSaving=true;receiveMonitoring(monitoring);
+    try{monitoring=await native('monitor-settings',settings);}catch(e){error(e);}
+    finally{monitorSaving=false;receiveMonitoring(monitoring);}
+  }
+  for(const id of ['monitor-enabled','monitor-auto','monitor-minimum','monitor-fps','monitor-resolution','monitor-quality'])$(id).onchange=saveMonitoring;
+  $('monitor-cancel').onclick=()=>native('monitor-cancel').then(receiveMonitoring).catch(error);
+  $('monitor-archive').onclick=()=>native('monitor-archive').catch(error);
+  $('monitor-output-folder').onclick=()=>native('batch-output-folder').then(refresh).catch(error);
+  $('monitor-map-folder').onclick=()=>native('pick-maps').then(refresh).catch(error);
+
+  let clipFiles=[],clipFilesLoading=false,clipEditing=null,clipConfirming=null,clipPlaying=null;
+  const autoPageOpen=()=>!$('auto-highlights-view').hidden;
+  function formatBytes(n){return n>=1073741824?(n/1073741824).toFixed(1)+' GB':n>=1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' KB';}
+  async function loadClipFiles(){
+    if(clipFilesLoading)return;clipFilesLoading=true;
+    try{const listing=await native('autoclips-list');clipFiles=listing.files||[];$('clip-files-folder').title=listing.root||'';renderClipFiles();}
+    catch(e){$('clip-files-summary').textContent='Couldn’t read the clip folder: '+(e?.message||e);}
+    finally{clipFilesLoading=false;}
+  }
+  function applyClipListing(listing){clipEditing=null;clipConfirming=null;clipFiles=listing?.files||[];
+    if(clipPlaying&&!clipFiles.some(f=>f.path===clipPlaying))closeClipPlayer();renderClipFiles();}
+  // In-app player. Releasing the <video> source frees the file handle so rename/delete work.
+  const clipVideo=$('clip-player-video');
+  function closeClipPlayer(){
+    if(!clipPlaying&&$('clip-player').hidden)return;
+    clipPlaying=null;clipVideo.pause();clipVideo.removeAttribute('src');clipVideo.load();
+    $('clip-player').hidden=true;$('clip-player-error').hidden=true;renderClipFiles();
+  }
+  async function playClip(file){
+    try{
+      const {url}=await native('autoclips-watch',{path:file.path});
+      clipPlaying=file.path;$('clip-player-title').textContent=file.name+file.extension;$('clip-player-error').hidden=true;
+      $('clip-player').hidden=false;clipVideo.src=url;renderClipFiles();
+      $('clip-player').scrollIntoView({block:'nearest',behavior:'smooth'});
+      clipVideo.play().catch(()=>{});
+    }catch(e){error(e);}
+  }
+  clipVideo.onerror=()=>{if(!clipPlaying)return;const p=$('clip-player-error');const m=clipVideo.error;p.textContent='This clip can’t play here. Use “Open in default player” instead.'+(m?` (code ${m.code}${m.message?': '+m.message:''})`:'');p.hidden=false;};
+  $('clip-player-close').onclick=closeClipPlayer;
+  $('clip-player-external').onclick=()=>{const path=clipPlaying;if(!path)return;clipVideo.pause();native('autoclips-open',{path}).catch(error);};
+  document.querySelectorAll('nav button').forEach(b=>{if(b.id!=='show-auto-highlights')b.addEventListener('click',()=>clipVideo.pause());});
+  async function releaseClip(path){if(clipPlaying===path){closeClipPlayer();await new Promise(r=>setTimeout(r,150));}}
+  function renderClipFiles(){
+    const query=$('clip-files-search').value.trim().toLowerCase();
+    const shown=clipFiles.filter(f=>!query||[f.name,f.map&&displayMap(f.map,f),f.medal,f.film,f.folder].some(v=>v&&String(v).toLowerCase().includes(query)));
+    const total=clipFiles.reduce((s,f)=>s+(f.size||0),0);
+    $('clip-files-summary').textContent=clipFiles.length?`${clipFiles.length} ${clipFiles.length===1?'clip':'clips'} · ${formatBytes(total)}`+(shown.length!==clipFiles.length?` · ${shown.length} shown`:''):'No clip files yet. New automatic clips will appear here.';
+    const list=$('clip-files-list');list.replaceChildren();
+    if(clipFiles.length&&!shown.length)list.append(el('p','No clips match this filter.','fine clip-files-empty'));
+    for(const file of shown){
+      const row=el('div',null,'clip-file');row.setAttribute('role','listitem');
+      const info=el('div',null,'clip-file-info');
+      if(clipEditing===file.path){
+        const input=document.createElement('input');input.className='clip-file-rename';input.value=file.name;input.maxLength=120;input.setAttribute('aria-label','New name for '+file.name);
+        const save=async()=>{const name=input.value.trim();if(!name||name===file.name){clipEditing=null;renderClipFiles();return;}
+          input.disabled=true;await releaseClip(file.path);try{applyClipListing(await native('autoclips-rename',{path:file.path,name}));}catch(e){input.disabled=false;error(e);input.focus();}};
+        input.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();save();}else if(e.key==='Escape'){clipEditing=null;renderClipFiles();}};
+        const wrap=el('div',null,'clip-file-edit');wrap.append(input,el('span',file.extension,'fine'));info.append(wrap);
+        const actions=el('div',null,'clip-file-actions');const ok=el('button','Save');ok.onclick=save;const cancel=el('button','Cancel');cancel.onclick=()=>{clipEditing=null;renderClipFiles();};
+        actions.append(ok,cancel);row.append(info,actions);list.append(row);setTimeout(()=>{input.focus();input.select();});continue;
+      }
+      info.append(el('strong',file.name+file.extension,'clip-file-name'));
+      const meta=[file.titleName,file.medal,file.map&&displayMap(file.map,file),file.durationSeconds?file.durationSeconds.toFixed(1)+' sec':null,formatBytes(file.size||0),new Date(file.modifiedUtc).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})].filter(Boolean).join(' · ');
+      info.append(el('p',meta,'fine'));if(file.exporting)info.append(el('p','Exporting…','fine clip-file-busy'));
+      const actions=el('div',null,'clip-file-actions');
+      const act=(label,fn,cls)=>{const b=el('button',label,cls);b.onclick=fn;actions.append(b);return b;};
+      if(clipConfirming===file.path){
+        actions.append(el('span','Move to Recycle Bin?','fine'));
+        act('Delete',async()=>{await releaseClip(file.path);try{applyClipListing(await native('autoclips-delete',{path:file.path}));}catch(e){error(e);loadClipFiles();}},'danger');
+        act('Cancel',()=>{clipConfirming=null;renderClipFiles();});
+      } else {
+        if(clipPlaying===file.path){row.classList.add('playing');act('Stop',closeClipPlayer);}
+        else act('Play',()=>playClip(file));
+        act('Rename',()=>{clipEditing=file.path;clipConfirming=null;renderClipFiles();}).disabled=!!file.exporting;
+        act('Show in folder',()=>native('autoclips-reveal',{path:file.path}).catch(error));
+        act('Delete',()=>{clipConfirming=file.path;clipEditing=null;renderClipFiles();},'danger').disabled=!!file.exporting;
+      }
+      row.append(info,actions);list.append(row);
+    }
+  }
+  $('clip-files-search').oninput=renderClipFiles;
+  $('clip-files-refresh').onclick=loadClipFiles;
+  $('clip-files-folder').onclick=()=>native('autoclips-folder').catch(error);
+  $('show-auto-highlights').addEventListener('click',loadClipFiles);
+  let clipFilesKey='';
+  function maybeReloadClipFiles(state){const key=JSON.stringify([state?.outputDirectory,state?.running,(state?.films||[]).map(f=>[f.hash,f.state,(f.clips||[]).map(c=>c.file)])]);
+    if(key===clipFilesKey)return;clipFilesKey=key;if(autoPageOpen()&&!clipEditing&&!clipConfirming)loadClipFiles();}
 
   refresh().catch(error);
 })();

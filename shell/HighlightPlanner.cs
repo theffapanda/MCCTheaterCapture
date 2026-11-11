@@ -50,7 +50,7 @@ internal static class HighlightPlanner
     private static readonly string[] Names = { "", "", "Double Kill", "Triple Kill", "Overkill", "Killtacular", "Killtrocity", "Killimanjaro", "Killtastrophe", "Killpocalypse", "Killionaire" };
     public static List<HighlightClip> Plan(FilmIndex index, HighlightOptions options, List<string>? warnings = null)
     {
-        options.Validate(); var clips = new List<HighlightClip>(); var chain = new List<FilmEvent>(); FilmEvent? award = null;
+        options.Validate(); bool halo3 = index.Title == "halo3"; var clips = new List<HighlightClip>(); var chain = new List<FilmEvent>(); FilmEvent? award = null;
         void Finish()
         {
             if (award != null && chain.Count >= options.MinimumKills && (!options.Exact || chain.Count == options.MinimumKills))
@@ -72,7 +72,10 @@ internal static class HighlightPlanner
             // A kill without the next medal already ends a chain below; do not
             // impose Halo 3's four-second rule on another game's native award.
             if (chain.Count > 0 && (chain[^1].Segment != first.Segment || first.Clock < chain[^1].Clock || index.Title=="halo3"&&first.Clock - chain[^1].Clock > 240)) Finish();
-            var kills = group.Where(e => e.Category == 0 && e.EventId == 0 && e.Recorder && !e.RecorderDied && e.CauseId.Length > 0).ToList();
+            // Halo 3 stores a raw game-event ID here (weapon/incident-specific),
+            // rather than the normalized kill ID used by later titles. Only
+            // count recorder-caused events with a concrete victim slot.
+            var kills = group.Where(e => e.Category == 0 && (halo3 || e.EventId == 0) && e.Recorder && !e.RecorderDied && e.CauseId.Length > 0 && (!halo3 || e.EffectSlot >= 0)).ToList();
             if (kills.Count > 0)
             {
                 if (chain.Count > 0 && chain[0].CauseId != kills[0].CauseId) Finish();
@@ -90,7 +93,7 @@ internal static class HighlightPlanner
                     else { chain.AddRange(kills); award = highest; }
                 }
             }
-            if (group.Any(e => e.Category == 0 && e.EventId is 0 or 1 && e.RecorderDied)) Finish();
+            if (group.Any(e => e.Category == 0 && (halo3 || e.EventId is 0 or 1) && e.RecorderDied)) Finish();
         }
         Finish();
         return options.Selection == "first-per-film" ? clips.Take(1).ToList() : clips;

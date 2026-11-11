@@ -25,7 +25,8 @@ internal static class HighlightCaptureCache
         Remove(file);
     }
 
-    internal static string KeyFor(string film, string filmHash, string mccRoot, string settings, int fov, string backend, CancellationToken token)
+    // Entry.Frames counts film ticks; a 120 fps prefix holds two encoded frames per tick.
+    internal static string KeyFor(string film, string filmHash, string mccRoot, string settings, int fov, string backend, CancellationToken token, int frameRate = 60, string captureKey = "")
     {
         var engines = new[] { "halo3", "haloreach", "halo4", "groundhog" }
             .Select(title => Path.Combine(mccRoot, title, title + ".dll"))
@@ -37,7 +38,7 @@ internal static class HighlightCaptureCache
             mccRoot = Path.GetFullPath(mccRoot).TrimEnd(Path.DirectorySeparatorChar).ToUpperInvariant(),
             settings = Hash(settings, token), fov, backend = Hash(backend, token),
             engines
-        });
+        }) + (frameRate == 60 ? "" : "|fps:" + frameRate) + captureKey; // Default 60 fps / 50 Mbps keys stay identical to existing caches.
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)));
     }
 

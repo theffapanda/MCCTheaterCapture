@@ -449,12 +449,15 @@ static int Run(int argc,wchar_t** argv) {
       else if(key==L"--video-only") {if(_wcsicmp(value,L"true")&&_wcsicmp(value,L"false")){std::fprintf(stderr,"--video-only expects true or false\n");return 2;}videoOnly=!_wcsicmp(value,L"true");ConfigureNativeVideoOnlyRecording(videoOnly);}
       else if(key==L"--record-seconds") {wchar_t* end=nullptr;recordSeconds=wcstod(value,&end);if(!end||*end||!std::isfinite(recordSeconds)||recordSeconds<=0||recordSeconds>43200){std::fprintf(stderr,"--record-seconds expects a positive duration up to43200\n");return 2;}}
       else if(key==L"--frame-rate") {if(!_wcsicmp(value,L"60"))exportFramesPerTick=1;else if(!_wcsicmp(value,L"120"))exportFramesPerTick=2;else{std::fprintf(stderr,"--frame-rate expects 60 or 120\n");return 2;}}
+      else if(key==L"--video-bitrate") {wchar_t* end=nullptr;const long mbps=wcstol(value,&end,10);if(end==value||!end||*end||mbps<10||mbps>150){std::fprintf(stderr,"--video-bitrate expects Mbps from 10 to 150\n");return 2;}ConfigureNativeVideoBitrate(static_cast<unsigned>(mbps));}
+      else if(key==L"--keyframe-half-seconds") {wchar_t* end=nullptr;const long half=wcstol(value,&end,10);if(end==value||!end||*end||half<1||half>8){std::fprintf(stderr,"--keyframe-half-seconds expects 1 to 8\n");return 2;}ConfigureNativeKeyframeInterval(static_cast<unsigned>(half));}
       else if(key==L"--record-start-tick") {wchar_t* end=nullptr;long selected=wcstol(value,&end,10);if(end==value||!end||*end||selected<0||selected>43200*60){std::fprintf(stderr,"--record-start-tick expects a bounded native tick\n");return 2;}recordStartTick=static_cast<int32_t>(selected);}
       else { std::fwprintf(stderr,L"Unknown argument: %s\n",key.c_str()); return 2; }
     }
     if(root.empty()||film.empty()||output.empty()||seconds<0||seconds>43200) return 2;
     if((videoOnly&&(audioOnly||!audioSource.empty()))||(audioOnly&&!audioSource.empty())){std::fprintf(stderr,"Conflicting audio/video pass options\n");return 2;}
-    if(exportFramesPerTick!=1&&(!videoOnly||recordStartTick>0)){std::fprintf(stderr,"--frame-rate 120 is supported only for whole-film video-only export passes\n");return 2;}
+    // Ranged 120 fps passes warm up at the native tick rate, then frame-step at 120 Hz from the start tick.
+    if(exportFramesPerTick!=1&&!videoOnly){std::fprintf(stderr,"--frame-rate 120 is supported only for video-only export passes\n");return 2;}
     offlineExport=videoOnly||!audioSource.empty();
     if(offlineExport){
       if(!backgroundMode||(!videoOnly&&!fs::is_regular_file(audioSource))){std::fprintf(stderr,"Offline export requires background mode and an existing audio-source MP4 or video-only mode\n");return 2;}

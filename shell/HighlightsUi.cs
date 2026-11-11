@@ -16,7 +16,7 @@ internal sealed partial class ViewerWindow
     private double highlightScanProgress;
     private string HighlightCurrentPath => Path.Combine(dataRoot, "highlight-current.json");
     private string HighlightScanPath => Path.Combine(dataRoot, "highlight-scan.json");
-    private bool HighlightRunning => highlightRecording?.IsRunning == true || highlightScanning;
+    private bool HighlightRunning => highlightRecording?.IsRunning == true || highlightScanning || MonitorExportRunning;
     private object HighlightsState() => new { scan = highlightScan, scanning = highlightScanning, scanMessage = highlightScanMessage, scanProgress = highlightScanProgress,
         job = highlightRecording?.Plan ?? savedHighlightJob, running = highlightRecording?.IsRunning == true };
     private void LoadHighlights()
@@ -86,6 +86,7 @@ internal sealed partial class ViewerWindow
                     OutputFormat = request.TryGetProperty("outputFormat",out var outputFormat) ? outputFormat.GetString() ?? "mp4" : "mp4",
                     OutputResolution = request.TryGetProperty("outputResolution",out var outputResolution) ? outputResolution.GetInt32() : 1440,
                     OutputQuality = request.TryGetProperty("outputQuality",out var outputQuality) ? outputQuality.GetString() ?? "high" : "high",
+                    Encoding = request.TryGetProperty("encoding",out var encodingJson) && encodingJson.ValueKind == JsonValueKind.Object ? encodingJson.Deserialize<ExportEncoding>(BatchRecording.Json) ?? new() : new(),
                     Clips = highlightScan.Clips.Where(c => ids.Contains(c.Id)).Select(c => JsonSerializer.Deserialize<HighlightClip>(JsonSerializer.Serialize(c, BatchRecording.Json), BatchRecording.Json)!).ToList()
                 };
                 if (plan.Clips.Count == 0) throw new IOException("Select at least one multikill clip.");

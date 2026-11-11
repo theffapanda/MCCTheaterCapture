@@ -15,11 +15,14 @@ internal sealed class HighlightJobPlan
     public string OutputFormat { get; set; } = "mp4";
     public int OutputResolution { get; set; } = 1440;
     public string OutputQuality { get; set; } = "high";
+    public ExportEncoding Encoding { get; set; } = new();
     public string MccRoot { get; set; } = "";
     public string OutputDirectory { get; set; } = "";
     public string? SettingsIni { get; set; }
     public string SettingsSnapshot { get; set; } = "";
     public int Fov { get; set; } = 91;
+    // 60 or 120 (Halo 3 only). Clip ranges stay in 60 Hz film ticks.
+    public int FrameRate { get; set; } = 60;
     public bool ContinueOnError { get; set; } = true;
     public HighlightOptions Options { get; set; } = new();
     public HighlightFormat Format { get; set; } = new();
@@ -81,6 +84,7 @@ internal sealed class HighlightRecording : IDisposable
     {
         BatchRecording.ValidateOutputFormat(Plan.OutputFormat);
         BatchRecording.ValidateVideoProfile(Plan.OutputResolution,Plan.OutputQuality);
+        Plan.Encoding ??= new(); Plan.Encoding.Validate();
         if (Plan.Format == null || Plan.Options == null || Plan.Clips == null || Plan.Clips.Any(c => c == null || c.Caption == null))
             throw new IOException("Highlight jobs need format settings, scan options and a caption object for every clip.");
         Plan.Options.Validate();
@@ -89,6 +93,8 @@ internal sealed class HighlightRecording : IDisposable
         if (Plan.Schema != "mcc-highlights/v1" || !Guid.TryParseExact(Plan.Id, "N", out _) || Plan.Clips.Count is < 1 or > 5000 || Plan.Clips.Select(c => c.Id).Distinct().Count() != Plan.Clips.Count)
             throw new IOException("Unsupported highlight job, duplicate clips or empty selection.");
         if (Plan.Mode is not ("separate" or "combined" or "both") || Plan.Fov is < 55 or > 120) throw new IOException("Invalid highlight delivery mode or FOV.");
+        if (Plan.FrameRate is not (60 or 120)) throw new IOException("Choose 60 or 120 fps.");
+        if (Plan.FrameRate == 120 && Plan.Clips.Any(c => FilmTitle.Detect(c.Film) != FilmTitle.Halo3)) throw new IOException("120 fps clips are available for Halo 3 films only.");
         Plan.MccRoot=FilmTitle.InstallationRoot(Plan.MccRoot);
         if (!Directory.Exists(Plan.MccRoot) || !File.Exists(backend)) throw new IOException("Choose the installed MCC content folder and native backend.");
         foreach(var source in Plan.Clips.Select(clip=>clip.Film).Distinct(StringComparer.OrdinalIgnoreCase))
@@ -123,6 +129,8 @@ internal sealed class HighlightRecording : IDisposable
             signatureData += "|native-h4-h2a-hud-fonts-v1";
         if(Plan.OutputFormat!="mp4")signatureData+="|container:"+Plan.OutputFormat;
         if(Plan.OutputResolution!=1440||Plan.OutputQuality!="high")signatureData+=$"|video:{Plan.OutputResolution}:{Plan.OutputQuality}";
+        if(Plan.FrameRate!=60)signatureData+="|fps:"+Plan.FrameRate;
+        signatureData+=Plan.Encoding.ExportKey(Plan.OutputQuality,audio:true)+Plan.Encoding.CaptureKey;
         var signature = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(signatureData)));
         if (Plan.Signature.Length > 0 && Plan.Signature != signature) throw new IOException("Highlight sources, ranges, settings, format, captions or renderer changed. Start a new highlight job.");
         Plan.Signature = signature;
@@ -170,14 +178,14 @@ internal sealed class HighlightRecording : IDisposable
                     string? cacheKey = null;
                     try
                     {
-                        cacheKey = HighlightCaptureCache.KeyFor(group.Key, index.Hash, Plan.MccRoot, Plan.SettingsSnapshot, Plan.Fov, backend, cancellation.Token);
+                        cacheKey = HighlightCaptureCache.KeyFor(group.Key, index.Hash, Plan.MccRoot, Plan.SettingsSnapshot, Plan.Fov, backend, cancellation.Token, Plan.FrameRate, Plan.Encoding.CaptureKey);
                         Publish("preparing", "Checking previously captured footage…");
                         cached = HighlightCaptureCache.TryAcquire(captureCacheRoot, cacheKey, pending.Max(c => c.EndTick), cancellation.Token, pending.Min(c => c.StartTick));
                         if (cached != null)
                         {
                             var media = await BatchRecording.Probe(cached.File, cancellation.Token);
                             await VerifyFormat(cached.File, cancellation.Token, true);
-                            if (media.Frames != cached.Frames) throw new IOException("Cached footage frame count changed.");
+                            if (media.Frames != cached.Frames * FramesPerTick) throw new IOException("Cached footage frame count changed.");
                         }
                     }
                     catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
@@ -201,7 +209,7 @@ internal sealed class HighlightRecording : IDisposable
                         {
                             var session = Path.Combine(Path.GetDirectoryName(checkpoint)!, "sessions", Guid.NewGuid().ToString("N"));
                             Publish("capturing", captureStart > 0 ? $"Advancing to {captureStart / 60.0:F1}s, then recording {through - captureStart / 60.0:F1}s for {pending.Length} clips." : $"Replaying {Path.GetFileName(group.Key)} through {through:F1}s for {pending.Length} selected clips.");
-                            using var capture = new BackgroundRecording(backend, group.Key, Plan.MccRoot, session, (captureEnd-captureStart)/60.0, prefix, Plan.SettingsSnapshot, Plan.Fov, captureStart);
+                            using var capture = new BackgroundRecording(backend, group.Key, Plan.MccRoot, session, (captureEnd-captureStart)/60.0, prefix, Plan.SettingsSnapshot, Plan.Fov, captureStart, Plan.FrameRate, Plan.Encoding);
                             active = capture;
                             capture.Changed += status =>
                             {
@@ -228,7 +236,8 @@ internal sealed class HighlightRecording : IDisposable
                             try
                             {
                                 var media = await BatchRecording.Probe(prefix, cancellation.Token);
-                                if (!HighlightCaptureCache.Store(captureCacheRoot, cacheKey, prefix, media.Frames, cancellation.Token, startTick: captureStart))
+                                if (media.Frames % FramesPerTick != 0) throw new IOException("Captured footage does not hold whole film ticks.");
+                                if (!HighlightCaptureCache.Store(captureCacheRoot, cacheKey, prefix, media.Frames / FramesPerTick, cancellation.Token, startTick: captureStart))
                                     Plan.FootageCacheWarning = "Export continues without retaining footage: the 8 GB cache has no room for this capture.";
                             }
                             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
@@ -252,16 +261,35 @@ internal sealed class HighlightRecording : IDisposable
                                 arguments.AddRange(new[] { "-i", captions, "-filter_complex", Plan.Format.FilterGraph(), "-map", "[out]" });
                             }
                             else arguments.AddRange(new[] { "-map", "0:v:0", "-vf", $"scale={BatchRecording.VideoWidth(Plan.OutputResolution)}:{Plan.OutputResolution}:flags=lanczos,setsar=1" });
-                            arguments.AddRange(new[] { "-t", Seconds(clip.EndTick - clip.StartTick), "-map", "0:a:0", "-c:v", "libx264", "-preset", "fast", "-crf", Plan.OutputQuality=="high"?"16":"20", "-profile:v", "high", "-pix_fmt", "yuv420p", "-video_track_timescale", "15360",
-                                "-c:a", "aac", "-b:a", "192k", "-movie_timescale", "48000", "-movflags", "+faststart", temp });
+                            arguments.AddRange(new[] { "-t", Seconds(clip.EndTick - clip.StartTick), "-map", "0:a:0" });
+                            arguments.AddRange(Plan.Encoding.X264Arguments(Plan.OutputQuality));
+                            arguments.AddRange(new[] { "-video_track_timescale", "15360",
+                                "-c:a", "aac", "-b:a", Plan.Encoding.AudioBitrateKbps.ToString(CultureInfo.InvariantCulture) + "k", "-movie_timescale", "48000", "-movflags", "+faststart", temp });
                             await BatchRecording.Execute(BatchRecording.FindTool("ffmpeg")!, arguments.ToArray(), cancellation.Token);
                             var media = await BatchRecording.Probe(temp, cancellation.Token);
-                            if (media.Frames != clip.EndTick - clip.StartTick || Math.Abs(media.Seconds - clip.DurationSeconds) > .05)
+                            if (media.Frames != (long)(clip.EndTick - clip.StartTick) * FramesPerTick || Math.Abs(media.Seconds - clip.DurationSeconds) > .05)
                                 throw new IOException("Highlight frame count or duration did not match its selected range.");
                             await VerifyFormat(temp, cancellation.Token);
                             long sourceStartSample = checked((long)(clip.StartTick - (cached?.StartTick ?? captureStart)) * 800);
                             long sampleCount = checked((long)(clip.EndTick - clip.StartTick) * 800);
-                            var delivery = await AudioDeliveryVerifier.VerifyAsync(cached?.File ?? prefix!, temp, sourceStartSample, sampleCount, cancellation.Token);
+                            AudioDeliveryVerification delivery;
+                            try { delivery = await AudioDeliveryVerifier.VerifyAsync(cached?.File ?? prefix!, temp, sourceStartSample, sampleCount, cancellation.Token); }
+                            catch (IOException)
+                            {
+                                // Some dense game audio loses too much detail at
+                                // 192 kbps to pass the existing sample verification.
+                                // Retry once at higher fidelity, with identical trim
+                                // arguments and unchanged verification thresholds.
+                                Publish("trimming", "Retrying clip with higher-quality game audio…");
+                                arguments[arguments.IndexOf("-b:a") + 1] = "320k";
+                                File.Delete(temp);
+                                await BatchRecording.Execute(BatchRecording.FindTool("ffmpeg")!, arguments.ToArray(), cancellation.Token);
+                                var retried = await BatchRecording.Probe(temp, cancellation.Token);
+                                if (retried.Frames != (long)(clip.EndTick - clip.StartTick) * FramesPerTick ||Math.Abs(retried.Seconds - clip.DurationSeconds) > .05)
+                                    throw new IOException("Retried highlight duration does not match its selected range.");
+                                await VerifyFormat(temp, cancellation.Token);
+                                delivery = await AudioDeliveryVerifier.VerifyAsync(cached?.File ?? prefix!, temp, sourceStartSample, sampleCount, cancellation.Token);
+                            }
                             clip.AudioDelivery = JsonSerializer.SerializeToElement(new { schema = "mcc-audio-delivery/v1", verificationRevision = AudioDeliveryRevision, verified = true, source = "same native capture", sourceStartSample, sampleCount, measurement = delivery }, BatchRecording.Json);
                             await BatchRecording.Execute(BatchRecording.FindTool("ffmpeg")!, new[] { "-v", "error", "-xerror", "-nostdin", "-i", temp, "-f", "null", "-" }, cancellation.Token);
                             if(Plan.OutputFormat!="mp4")
@@ -293,7 +321,7 @@ internal sealed class HighlightRecording : IDisposable
             if (Plan.Mode != "separate" && (Plan.CombinedInputsHash != combinedInputs || !await BatchRecording.ReusableCombined(Plan.CombinedFile, Plan.CombinedSha256, cancellation.Token)))
             {
                 Publish("joining", "Joining selected highlights with chapters…");
-                var joinPlan = new BatchPlan { Name = Plan.Name, OutputFormat = Plan.OutputFormat, OutputDirectory = Plan.OutputDirectory, Items = Plan.Clips.Select(c => new BatchItem { File = c.File, Name = c.Medal + " - " + c.Recorder, Frames = c.EndTick - c.StartTick, DurationSeconds = c.DurationSeconds }).ToList() };
+                var joinPlan = new BatchPlan { Name = Plan.Name, OutputFormat = Plan.OutputFormat, OutputDirectory = Plan.OutputDirectory, Items = Plan.Clips.Select(c => new BatchItem { File = c.File, Name = c.Medal + " - " + c.Recorder, Frames = (c.EndTick - c.StartTick) * FramesPerTick, DurationSeconds = c.DurationSeconds }).ToList() };
                 Plan.CombinedFile = await BatchRecording.Join(joinPlan, cancellation.Token); Plan.CombinedSha256 = BatchRecording.Hash(Plan.CombinedFile); Plan.CombinedInputsHash = combinedInputs;
             }
             Plan.Finished = true; Plan.Progress = 1; Publish("completed", $"Saved {Plan.Clips.Count} multikill clips" + (Plan.Mode == "separate" ? "." : " and the combined reel."));
@@ -306,6 +334,7 @@ internal sealed class HighlightRecording : IDisposable
         catch (Exception error) { Plan.Finished = true; Plan.State = "failed"; Plan.Message = error.Message; if (jobLock != null) Publish("failed", error.Message); else Changed?.Invoke(Plan); }
         finally { active = null; jobLock?.Dispose(); }
     }
+    private int FramesPerTick => Plan.FrameRate / 60;
     private static string Seconds(int ticks) => (ticks / 60.0).ToString("R", CultureInfo.InvariantCulture);
     private static bool HasVerifiedAudioDelivery(HighlightClip clip) =>
         clip.AudioDelivery is JsonElement proof && proof.ValueKind == JsonValueKind.Object &&
@@ -321,15 +350,15 @@ internal sealed class HighlightRecording : IDisposable
         measurement.TryGetProperty("channels", out var channels) && channels.ValueKind == JsonValueKind.Number && channels.TryGetInt32(out int channelCount) && channelCount == 2 &&
         measurement.TryGetProperty("samplesVerified", out var covered) && covered.ValueKind == JsonValueKind.Number && covered.TryGetInt64(out long checkedSamples) && checkedSamples == samples &&
         measurement.TryGetProperty("windowsVerified", out var windows) && windows.ValueKind == JsonValueKind.Number && windows.TryGetInt32(out int windowCount) && windowCount > 0;
-    private void WriteManifest(HighlightClip clip) => File.WriteAllText(clip.File + ".json", JsonSerializer.Serialize(new { schema = "mcc-highlight-clip/v1", renderer = "native-medals-v1", indexSchema = "mcc-film-events/v1", Plan.Fov, Plan.Format, Plan.OutputResolution, Plan.OutputQuality, settingsHash = BatchRecording.Hash(Plan.SettingsSnapshot), clip }, BatchRecording.Json));
+    private void WriteManifest(HighlightClip clip) => File.WriteAllText(clip.File + ".json", JsonSerializer.Serialize(new { schema = "mcc-highlight-clip/v1", renderer = "native-medals-v1", indexSchema = "mcc-film-events/v1", Plan.Fov, Plan.Format, Plan.OutputResolution, Plan.OutputQuality, Plan.Encoding, settingsHash = BatchRecording.Hash(Plan.SettingsSnapshot), clip }, BatchRecording.Json));
     private async Task VerifyFormat(string file, CancellationToken token, bool nativeCapture = false)
     {
         using var doc = JsonDocument.Parse(await BatchRecording.Execute(BatchRecording.FindTool("ffprobe")!, new[] { "-v", "error", "-show_streams", "-of", "json", file }, token));
         var streams = doc.RootElement.GetProperty("streams").EnumerateArray().ToArray();
         var v = streams.Single(s => s.GetProperty("codec_type").GetString() == "video"); var a = streams.Single(s => s.GetProperty("codec_type").GetString() == "audio");
         int width = nativeCapture ? 2560 : Plan.Format.IsPortrait ? Plan.Format.Width : BatchRecording.VideoWidth(Plan.OutputResolution), height = nativeCapture ? 1440 : Plan.Format.IsPortrait ? Plan.Format.Height : Plan.OutputResolution;
-        if (v.GetProperty("width").GetInt32() != width || v.GetProperty("height").GetInt32() != height || v.GetProperty("r_frame_rate").GetString() != "60/1" || a.GetProperty("sample_rate").GetString() != "48000" || a.GetProperty("channels").GetInt32() != 2)
-            throw new IOException($"Highlight media did not pass {width}×{height} / 60 fps / stereo game-audio validation.");
+        if (v.GetProperty("width").GetInt32() != width || v.GetProperty("height").GetInt32() != height || v.GetProperty("r_frame_rate").GetString() != $"{Plan.FrameRate}/1" || a.GetProperty("sample_rate").GetString() != "48000" || a.GetProperty("channels").GetInt32() != 2)
+            throw new IOException($"Highlight media did not pass {width}×{height} / {Plan.FrameRate} fps / stereo game-audio validation.");
     }
     public async Task CancelAsync() { cancellation.Cancel(); if (active != null) await active.CancelAsync(); if (running != null) await running; }
     public void Dispose() { if (IsRunning) throw new InvalidOperationException("Cancel before disposing the highlight job."); cancellation.Dispose(); }
