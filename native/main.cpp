@@ -591,6 +591,13 @@ static int Run(int argc,wchar_t** argv) {
     enum class BackgroundPhase {Preparing,Warming,Starting,Recording,Stopping,Finished};
     BackgroundPhase backgroundPhase=BackgroundPhase::Preparing;bool backgroundSuccess=false,backgroundPrimeIssued=false;std::string backgroundReason;
     auto backgroundPhaseStart=Clock::now();
+    // Size of the MP4 being written, read through a handle because directory metadata lags an open file.
+    auto outputBytes=[&]()->long long {
+      HANDLE file=CreateFileW(recordOutput.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
+      if(file==INVALID_HANDLE_VALUE)return -1;
+      LARGE_INTEGER size{};const bool ok=GetFileSizeEx(file,&size)!=0;CloseHandle(file);return ok?size.QuadPart:-1;
+    };
+    long long backgroundDrainBytes=-1;
     auto stopBackground=[&](const std::string& reason,bool success) {
       if(backgroundPhase==BackgroundPhase::Stopping||backgroundPhase==BackgroundPhase::Finished)return;
       backgroundReason=reason;backgroundSuccess=success;backgroundPhase=BackgroundPhase::Stopping;backgroundPhaseStart=Clock::now();
@@ -663,7 +670,10 @@ static int Run(int argc,wchar_t** argv) {
           else if(recordSeconds>0&&JsonNumber(recording,"durationSeconds")>=recordSeconds)stopBackground("Requested recording duration reached",true);
         } else if(backgroundPhase==BackgroundPhase::Stopping) {
           if(!IsNativeRecordingActive()){backgroundPhase=BackgroundPhase::Finished;break;}
-          if(Clock::now()-backgroundPhaseStart>std::chrono::seconds(30)) {backgroundSuccess=false;backgroundReason="Timed out draining native MP4 encoders";LogText("failure",backgroundReason);break;}
+          // A slow encoder may need longer than any fixed limit to flush its last frames. Only an output file that
+          // has stopped growing means the encoders are stuck.
+          if(const auto bytes=outputBytes();bytes!=backgroundDrainBytes){backgroundDrainBytes=bytes;backgroundPhaseStart=Clock::now();}
+          if(Clock::now()-backgroundPhaseStart>std::chrono::seconds(60)) {backgroundSuccess=false;backgroundReason="Timed out draining native MP4 encoders";LogText("failure",backgroundReason);break;}
         }
       }
       if(thread&&WaitForSingleObject(thread,0)==WAIT_OBJECT_0) {

@@ -65,7 +65,7 @@ struct Recorder {
     std::vector<std::pair<LONGLONG,int>> tickAnchors;
     int firstTick=-1,lastTick=-1;
     int observedFilmTick=-1;
-    double readbackMs=0,convertMs=0,encodeMs=0,poolWaitMs=0;
+    double readbackMs=0,convertMs=0,encodeMs=0,poolWaitMs=0,encoderWaitMs=0;
     std::deque<std::unique_ptr<Frame>> queue,pool;
     // The following state belongs exclusively to NativeRecorderFrame.
     std::array<GpuFrame,kGpuFrames> gpu;std::deque<size_t> gpuOrder;
@@ -230,6 +230,25 @@ HRESULT Write(IMFSinkWriter* writer,DWORD stream,const Frame& frame,uint64_t ind
     if(SUCCEEDED(hr))hr=writer->WriteSample(stream,sample.Get());
     {std::lock_guard<std::mutex> lock(g.mutex);g.encodeMs+=Milliseconds(started);}return hr;
 }
+// The sink writer runs unthrottled, so WriteSample only queues each 14.7 MB frame. Offline rendering can outrun a
+// slow encoder without bound, leaving Finalize a backlog that takes minutes to flush (or exhausting memory first).
+// Hold the worker, and through the frame pool the renderer, until the encoder catches up. An encoder that sits on
+// frames until it receives more input is not behind: after a second without output its latency joins the limit.
+void AwaitEncoder(IMFSinkWriter* writer,DWORD stream,uint64_t& limit){
+    const auto started=ProfileClock::now();auto progressed=started;uint64_t best=0;bool waited=false;
+    while(true){
+        MF_SINK_WRITER_STATISTICS stats{};stats.cb=sizeof(stats);
+        if(FAILED(writer->GetStatistics(stream,&stats)))break;
+        const uint64_t backlog=stats.qwNumSamplesReceived-std::min(stats.qwNumSamplesReceived,stats.qwNumSamplesEncoded);
+        if(backlog<=limit)break;
+        const auto now=ProfileClock::now();
+        if(stats.qwNumSamplesEncoded>best){best=stats.qwNumSamplesEncoded;progressed=now;}
+        else if(now-progressed>std::chrono::seconds(1)){limit=backlog+4;break;}
+        {std::lock_guard<std::mutex> lock(g.mutex);if(g.failed)break;}
+        waited=true;std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if(waited){std::lock_guard<std::mutex> lock(g.mutex);g.encoderWaitMs+=Milliseconds(started);}
+}
 // Audio is timestamped against the same QPC spans that advance the video clock.
 // The capture source includes this backend PID only. Silence at stream boundaries
 // is explicit and counted, rather than stretching captured audio across a pause.
@@ -387,7 +406,7 @@ void EncodeSession(){
         if(!audioOnly)for(size_t n=0;n<kPoolFrames;++n){auto frame=std::make_unique<Frame>();frame->bgra.resize(static_cast<size_t>(kWidth)*kHeight*4);pool.push_back(std::move(frame));}
         {std::lock_guard<std::mutex> lock(g.mutex);g.pool=std::move(pool);g.encoderReady=true;g.phase=g.stop?"stopping":"recording";}
         g.cv.notify_all();Log("native_recording_started",Utf8(path)+(audioOnly?std::string("; audio-only game soundtrack; AAC 48000 Hz stereo 192000 bps"):"; native 2560x1440 "+std::to_string(VideoFps())+" fps H.264 "+std::to_string(VideoBitrate())+" bps target, GOP "+std::to_string(VideoGop())+" frames; process-only AAC 48000 Hz stereo 192000 bps"));
-        std::unique_ptr<Frame> previous;uint64_t next=0;
+        std::unique_ptr<Frame> previous;uint64_t next=0,backlogLimit=16;
         while(true){
             std::unique_ptr<Frame> frame;
             bool closed=false;
@@ -406,6 +425,7 @@ void EncodeSession(){
             if(SUCCEEDED(hr))hr=Write(writer.Get(),stream,*frame,frame->index);
             if(FAILED(hr)){Fail("H.264 encoder failed while writing a frame",hr);break;}
             next=frame->index+1;
+            if(Offline())AwaitEncoder(writer.Get(),stream,backlogLimit);
             {std::lock_guard<std::mutex> lock(g.mutex);++g.encoded;g.lastTick=frame->filmTick;if(g.firstTick<0)g.firstTick=frame->filmTick;
              if(previous)g.pool.push_back(std::move(previous));previous=std::move(frame);}
             g.cv.notify_all();
@@ -487,7 +507,7 @@ bool RequestStartNativeRecording(const wchar_t* outputPath){
      if(!rejection.empty()){g.error=rejection;if(!g.busy&&!g.start)g.phase="error";}
      else{g.path=path.wstring();g.phase="starting";g.error.clear();g.failed=false;g.incomplete=false;g.stop=false;g.producerClosed=false;g.encoderReady=false;g.fallback=false;g.hardwareKnown=false;g.hardwareEncoder=false;g.encoder.clear();g.qualityVsSpeed=g.gopFrames=g.rateControlMode=g.cabac=-1;
         g.captured=g.encoded=g.repeated=g.dropped=g.pendingGpu=g.queuePeak=0;g.audioFrames=g.audioSourceFrames=g.audioGapFrames=g.audioNonSilentFrames=g.audioDiscontinuities=0;
-        g.readbackMs=g.convertMs=g.encodeMs=g.poolWaitMs=0;
+        g.readbackMs=g.convertMs=g.encodeMs=g.poolWaitMs=g.encoderWaitMs=0;
         g.audioKnownUntil=0;g.audioSpans.clear();g.tickAnchors.clear();g.firstTick=g.lastTick=g.observedFilmTick=-1;g.queue.clear();g.pool.clear();++g.generation;g.start=true;}}
     if(!rejection.empty()){Log("native_recording_rejected",rejection);return false;}
     g.cv.notify_all();return true;
@@ -595,7 +615,7 @@ std::string SnapshotNativeRecordingJson(){
        <<",\"encodingProfile\":"<<Quote(!Offline()?kEncodingProfile:exportFps==120?"offline-1440p120-v1":"offline-1440p60-v2")<<",\"qualityVsSpeed\":"<<(g.qualityVsSpeed<0?"null":std::to_string(g.qualityVsSpeed))<<",\"gopFrames\":"<<(g.gopFrames<0?"null":std::to_string(g.gopFrames))<<",\"rateControlMode\":"<<(g.rateControlMode<0?"null":std::to_string(g.rateControlMode))<<",\"cabac\":"<<(g.cabac<0?"null":g.cabac?"true":"false")
        <<",\"audioFrames\":"<<g.audioFrames<<",\"audioSourceFrames\":"<<g.audioSourceFrames<<",\"audioGapFrames\":"<<g.audioGapFrames<<",\"audioNonSilentFrames\":"<<g.audioNonSilentFrames<<",\"audioDiscontinuities\":"<<g.audioDiscontinuities
        <<",\"frames\":"<<g.encoded<<",\"encodedFrames\":"<<g.encoded<<",\"capturedFrames\":"<<g.captured
-       <<",\"readbackMs\":"<<g.readbackMs<<",\"convertMs\":"<<g.convertMs<<",\"encodeMs\":"<<g.encodeMs<<",\"poolWaitMs\":"<<g.poolWaitMs
+       <<",\"readbackMs\":"<<g.readbackMs<<",\"convertMs\":"<<g.convertMs<<",\"encodeMs\":"<<g.encodeMs<<",\"poolWaitMs\":"<<g.poolWaitMs<<",\"encoderWaitMs\":"<<g.encoderWaitMs
        <<",\"timingMode\":"<<Quote(!Offline()?"real-time":"render-acknowledged-60hz")<<",\"simulationSteps\":"<<NativeExportFrameStepCount()<<",\"observedFilmCursor\":"<<g.observedFilmTick
        <<",\"repeatedFrames\":"<<g.repeated<<",\"droppedFrames\":"<<g.dropped<<",\"queueDepth\":"<<g.queue.size()<<",\"queuePeak\":"<<g.queuePeak<<",\"pendingGpuFrames\":"<<g.pendingGpu<<",\"durationSeconds\":"<<seconds<<",\"seconds\":"<<seconds
        <<",\"firstFilmTick\":"<<g.firstTick<<",\"lastFilmTick\":"<<g.lastTick<<",\"encoder\":"<<Quote(g.encoder)<<",\"hardwarePreferred\":true,\"hardwareEncoder\":"<<(g.hardwareKnown?(g.hardwareEncoder?"true":"false"):"null")<<",\"softwareFallback\":"<<(g.fallback?"true":"false")
